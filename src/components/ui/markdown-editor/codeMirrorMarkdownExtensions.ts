@@ -140,6 +140,14 @@ const locusEditorTheme = EditorView.theme({
   ".cm-selectionBackground": {
     background: "color-mix(in srgb, var(--accent-color) 18%, transparent)",
   },
+  // Chromium can repaint the whole text fragment twice when a fully selected
+  // line becomes partially selected with a transparent native selection.
+  // Keep 1/255 alpha (smaller values can round to zero); drawSelection still
+  // supplies the visible background. The extra .cm-content beats its hiding
+  // rule without overriding the native Highlight rule for focused widgets.
+  ".cm-content .cm-line::selection, .cm-content .cm-line ::selection": {
+    backgroundColor: "#00000001 !important",
+  },
   "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground": {
     background: "color-mix(in srgb, var(--accent-color) 18%, transparent)",
   },
