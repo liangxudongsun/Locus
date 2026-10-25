@@ -2,13 +2,18 @@
 //!
 //! wry registers its WebView2 file drop target once, on the child HWNDs that
 //! exist when the controller is created, and turns WebView2's own external
-//! drop off. A webview created hidden and unfocused at runtime (workspace
-//! windows, Workbench windows) has not created its content HWNDs at that
+//! drop off. A webview created hidden and unfocused at runtime (workspace,
+//! Workbench and sub windows) has not created its content HWNDs at that
 //! point, so the HWNDs under the cursor never get a target and every file drag
-//! is refused (tauri-apps/tauri#14643, tauri-apps/wry#1639). After the page
-//! loads, and whenever the window gains focus, this registers an equivalent
-//! target on each webview HWND that still has none. Targets wry registered are
-//! left in place.
+//! is refused (tauri-apps/tauri#14643, tauri-apps/wry#1639). Those windows are
+//! built unfocused on purpose: wry moves focus into a focused webview at
+//! creation, which makes the hidden window the foreground window.
+//!
+//! This registers an equivalent target on each webview HWND that still has
+//! none: after the page loads, when the window gains focus, and when a hidden
+//! window is revealed or claimed (the content HWNDs can appear after the page
+//! load). Targets wry or WebView2 registered are left in place, so windows
+//! that already accept drops are unchanged.
 //!
 //! Like wry's targets, these are not revoked: the HWNDs, some of them owned by
 //! the WebView2 browser process, are torn down together with the window.
@@ -54,12 +59,26 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
     }
 }
 
+/// Schedules `ensure` on the main thread, for callers that reveal or claim a
+/// hidden window from a command thread.
+pub fn ensure_on_main_thread(window: &tauri::WebviewWindow) {
+    let target = window.as_ref().window();
+    if let Err(error) = window.run_on_main_thread(move || ensure(&target)) {
+        eprintln!(
+            "[Locus] failed to schedule webview drop target registration for {}: {error}",
+            window.label()
+        );
+    }
+}
+
 /// Registers the supplementary target on webview HWNDs that have no drop
 /// target yet. Must run on the main (OLE) thread.
+///
+/// Every window is covered, because wry's own registration has the same gap
+/// for any window built hidden and unfocused. File paths still reach Locus
+/// drop handling only for the labels `handle_locus_window_drag_drop` accepts;
+/// other windows receive the same `tauri://drag-*` events wry would emit.
 pub fn ensure(window: &tauri::Window) {
-    if !crate::commands::is_locus_drop_target_label(window.label()) {
-        return;
-    }
     let Ok(hwnd) = window.hwnd() else {
         return;
     };

@@ -182,7 +182,11 @@ fn base_window_builder<'a>(
             .closable(true)
             .inner_size(1120.0, 760.0)
             .min_inner_size(620.0, 420.0)
-            .visible(false);
+            .visible(false)
+            // A focused webview takes the foreground at creation even while its
+            // window is hidden. Revealing a claimed window focuses it, and
+            // `webview_drop_target` registers the drop targets wry misses.
+            .focused(false);
     if let Some(owner_window) = app_handle.get_webview_window(owner_label) {
         builder = builder
             .parent(&owner_window)

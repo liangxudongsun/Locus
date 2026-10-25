@@ -180,7 +180,11 @@ fn build_sub_window(
     .maximizable(request.map(|request| request.maximizable).unwrap_or(true))
     .minimizable(request.map(|request| request.minimizable).unwrap_or(false))
     .closable(request.map(|request| request.closable).unwrap_or(true))
-    .visible(false);
+    .visible(false)
+    // A focused webview takes the foreground at creation even while its window
+    // is hidden. The frontend focuses the window when it reveals it, and
+    // `webview_drop_target` registers the drop targets wry misses.
+    .focused(false);
     if let Some(color) = parse_background_color(&color) {
         builder = builder.background_color(color);
     }
@@ -209,7 +213,13 @@ fn build_sub_window(
 }
 
 pub fn ensure_sub_window_pool_window(app_handle: &AppHandle) -> Result<(), String> {
-    {
+    // Check and reserve under one lock. The pending label is set before the
+    // window is built and cleared when the build fails or the window is
+    // destroyed, so a pending label whose window is not registered yet is a
+    // build in flight. Treating it as stale let concurrent warmups from
+    // several renderers build a second pool window that never became
+    // available.
+    let label = {
         let mut state = sub_window_pool_state()
             .lock()
             .map_err(|_| "Sub-window pool state is unavailable".to_string())?;
@@ -219,18 +229,9 @@ pub fn ensure_sub_window_pool_window(app_handle: &AppHandle) -> Result<(), Strin
             }
             state.available_label = None;
         }
-        if let Some(label) = state.pending_label.clone() {
-            if app_handle.get_webview_window(&label).is_some() {
-                return Ok(());
-            }
-            state.pending_label = None;
+        if state.pending_label.is_some() {
+            return Ok(());
         }
-    }
-
-    let label = {
-        let mut state = sub_window_pool_state()
-            .lock()
-            .map_err(|_| "Sub-window pool state is unavailable".to_string())?;
         state.next_index = state.next_index.saturating_add(1);
         let label = format!("{}{}", SUB_WINDOW_POOL_LABEL_PREFIX, state.next_index);
         state.pending_label = Some(label.clone());
@@ -343,6 +344,10 @@ fn open_sub_window_inner(
             .get_webview_window(&label)
             .ok_or_else(|| format!("Claimed sub-window pool window vanished: {label}"))?;
         configure_claimed_sub_window(&window, &request)?;
+        // The pool window was built hidden and unfocused, so wry registered no
+        // drop targets; its content HWNDs exist once its shell has loaded.
+        #[cfg(target_os = "windows")]
+        crate::webview_drop_target::ensure_on_main_thread(&window);
         if let Ok(mut state) = sub_window_pool_state().lock() {
             state.claimed.insert(kind.clone(), label.clone());
             state
