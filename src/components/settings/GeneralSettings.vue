@@ -70,7 +70,13 @@ const emit = defineEmits<{
 
 const notificationStore = useNotificationStore();
 const workspaceContextStore = useWorkspaceContextStore();
-const { state: documentEditingSettings, setPunctuationPairing } = useDocumentEditingSettings();
+const { state: documentEditingSettings, setPunctuationPairing, setCommentAuthor } = useDocumentEditingSettings();
+
+function onCommentAuthorChange(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  setCommentAuthor(input.value);
+  input.value = documentEditingSettings.commentAuthor;
+}
 const { state: newSessionSettings, setAgentMode, setDefaultAgentId } = useNewSessionSettings();
 // Agent ids never start with "@", so the two modes share the dropdown with pinned Agents.
 const REMEMBER_AGENT_OPTION = "@remember";
@@ -968,6 +974,22 @@ async function selectPythonRuntime(selectedId: string) {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.commentAuthor") }}</div>
+    <p class="section-desc">{{ t("settings.general.commentAuthorDesc") }}</p>
+    <input
+      class="number-setting-input text-setting-input"
+      type="text"
+      maxlength="64"
+      spellcheck="false"
+      autocomplete="off"
+      :value="documentEditingSettings.commentAuthor"
+      :aria-label="t('settings.general.commentAuthor')"
+      @change="onCommentAuthorChange"
+      @keydown.enter="($event.target as HTMLInputElement).blur()"
+    />
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.general.debugMode") }}</div>
     <p class="section-desc">{{ t("settings.general.debugModeDesc") }}</p>
     <div class="debug-mode-controls">
@@ -1380,6 +1402,11 @@ async function selectPythonRuntime(selectedId: string) {
 .number-setting-input:disabled {
   opacity: 0.55;
   cursor: default;
+}
+.text-setting-input {
+  width: 240px;
+  max-width: 100%;
+  text-align: left;
 }
 .close-behavior-segmented {
   width: fit-content;

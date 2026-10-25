@@ -37,12 +37,15 @@ import type {
   ProjectExplorerFilePreview,
   ProjectExplorerFileRevision,
 } from "../../types/workbench";
-import type { WorkbenchEditorTransferSnapshot } from "../../types/workbench";
+import type { EditorSnapshotOptions, WorkbenchEditorTransferSnapshot } from "../../types/workbench";
+import type { ReadingTarget } from "../../services/readingPosition";
 import WorkspaceAssetPreview from "../asset/WorkspaceAssetPreview.vue";
 import AssetTextViewer from "../asset/AssetTextViewer.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
+import MarkdownCommentRail from "../ui/markdown-editor/MarkdownCommentRail.vue";
+import { createMarkdownCommentController } from "../ui/markdown-editor/markdownCommentController";
 import WorkspaceCsvEditor from "../csv/WorkspaceCsvEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
 import type { MarkdownEditorSelection } from "../ui/markdown-editor/markdownEditorSelection";
@@ -130,6 +133,8 @@ const preview = computed(() => fileSession.document.value?.preview ?? null);
 const assetPayload = computed(() => fileSession.document.value?.assetPayload ?? null);
 const observedDiskRevision = ref<ProjectExplorerFileRevision | null>(null);
 const sourceEditor = ref<InstanceType<typeof BaseMarkdownEditor> | null>(null);
+/** Comments of the rendered document, shown in the page's right margin. */
+const documentComments = createMarkdownCommentController();
 const documentScrollerRef = ref<HTMLElement | null>(null);
 const documentPageRef = ref<HTMLElement | null>(null);
 const documentBodyRef = ref<HTMLElement | null>(null);
@@ -167,6 +172,16 @@ const editorViewMode = computed<MarkdownEditorViewMode>(() => (
 const isMarkdownDocument = computed(() => (
   preview.value?.kind === "text" && preview.value.editable && editorViewMode.value === "rendered"
 ));
+/** Durable reading position; checkout paths share it across a project's worktrees. */
+const readingTarget = computed<ReadingTarget | null>(() => {
+  if (!isMarkdownDocument.value || loading.value) return null;
+  const path = normalizePath(filePath.value);
+  if (props.workspaceRef) return { checkoutId: props.workspaceRef.checkoutId, resource: ["file", path] };
+  if (props.projectId && !/^(?:[a-z]:\/|\/)/i.test(path)) {
+    return { checkoutId: null, resource: ["project-file", props.projectId, path] };
+  }
+  return { checkoutId: null, resource: ["file", path] };
+});
 const documentTitle = computed(() => preview.value?.name.replace(/\.(?:md|markdown)$/iu, "") ?? "");
 const titleDraft = ref("");
 const titleError = ref("");
@@ -386,6 +401,7 @@ async function applyPendingPosition(): Promise<boolean> {
   await nextTick();
   const view = sourceEditor.value?.getEditorView();
   if (!view) return false;
+  sourceEditor.value?.cancelReadingRestore?.();
   const highlight = position.highlight
     ? resolveToolFilePreviewHighlightRanges(view.state.doc.toString(), 1, position.highlight)[0]
     : null;
@@ -421,9 +437,14 @@ function onEditorDocumentChange(change: MarkdownEditorDocumentChange): void {
   fileSession.updateDraft({ ...fileSession.draft.value, text: change.doc });
 }
 
+// Each edit installs a new draft object, so an unchanged draft reuses its text.
+let serializedDraft: { draft: FileDocumentDraft; text: string } | null = null;
 function serializedEditorText(): string {
   const draft = fileSession.draft.value;
-  return serializeTextDocumentLineEndings(draft.text.toString(), draft.lineEnding);
+  if (serializedDraft?.draft !== draft) {
+    serializedDraft = { draft, text: serializeTextDocumentLineEndings(draft.text.toString(), draft.lineEnding) };
+  }
+  return serializedDraft.text;
 }
 
 async function saveFile(): Promise<boolean> {
@@ -436,15 +457,16 @@ async function saveFile(): Promise<boolean> {
   return fileSession.save();
 }
 
-function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
-  if (isCsv.value && csvEditor.value) return csvEditor.value.exportTransferSnapshot();
+function exportTransferSnapshot(options: EditorSnapshotOptions = {}): WorkbenchEditorTransferSnapshot {
+  if (isCsv.value && csvEditor.value) return csvEditor.value.exportTransferSnapshot(options);
   if (!preview.value || loading.value) return { kind: "resource" };
   const view = sourceEditor.value?.getEditorView();
   return {
     kind: "workspaceFile",
     dirty: dirty.value,
     conflicted: diskChanged.value,
-    text: serializedEditorText(),
+    // Saved work state restores a saved file from disk; only an unsaved buffer is kept.
+    ...(!options.workState || dirty.value || diskChanged.value ? { text: serializedEditorText() } : {}),
     contentHash: preview.value?.contentHash ?? "",
     originalLineEnding: fileSession.draft.value.lineEnding,
     selection: view ? {
@@ -452,6 +474,7 @@ function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
       head: view.state.selection.main.head,
     } : null,
     scrollTop: documentScrollerRef.value?.scrollTop ?? view?.scrollDOM.scrollTop ?? null,
+    scrollAnchor: readingTarget.value ? sourceEditor.value?.lastReadingAnchor?.() ?? null : null,
   };
 }
 
@@ -468,26 +491,38 @@ async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot, 
   const view = sourceEditor.value?.getEditorView();
   if (!view || preview.value?.kind !== "text" || !preview.value.editable) return false;
   const changedOnDisk = !!snapshot.contentHash && preview.value.contentHash !== snapshot.contentHash;
-  if (changedOnDisk && !recovering) {
+  // Without a buffer the snapshot was saved, so the loaded disk version is current.
+  const buffer = snapshot.text;
+  if (changedOnDisk && !recovering && buffer !== undefined) {
     error.value = t("development.editor.transferConflict");
     return false;
   }
+  sourceEditor.value?.cancelReadingRestore?.();
   if (recovering && (snapshot.conflicted || (changedOnDisk && snapshot.dirty))) diskChanged.value = true;
-  const normalized = normalizeTextDocumentLineEndings(recovering && changedOnDisk && !snapshot.dirty
-    ? preview.value.text ?? "" : snapshot.text);
-  fileSession.updateDraft({ text: markdownEditorTextFromString(normalized), lineEnding: snapshot.originalLineEnding });
+  const replace = buffer !== undefined && !(recovering && changedOnDisk && !snapshot.dirty);
+  const normalized = replace ? normalizeTextDocumentLineEndings(buffer) : "";
+  if (replace) {
+    fileSession.updateDraft({ text: markdownEditorTextFromString(normalized), lineEnding: snapshot.originalLineEnding });
+  }
+  const length = replace ? normalized.length : view.state.doc.length;
   const selection = snapshot.selection
     ? {
-        anchor: Math.min(normalized.length, Math.max(0, snapshot.selection.anchor)),
-        head: Math.min(normalized.length, Math.max(0, snapshot.selection.head)),
+        anchor: Math.min(length, Math.max(0, snapshot.selection.anchor)),
+        head: Math.min(length, Math.max(0, snapshot.selection.head)),
       }
     : undefined;
-  view.dispatch({
-    changes: { from: 0, to: view.state.doc.length, insert: normalized },
-    selection,
-  });
-  if (snapshot.scrollTop != null) {
-    await nextTick();
+  if (replace) {
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: normalized },
+      selection,
+    });
+  } else if (selection) {
+    view.dispatch({ selection });
+  }
+  await nextTick();
+  if (snapshot.scrollAnchor && readingTarget.value) {
+    sourceEditor.value?.restoreReadingAnchor?.(snapshot.scrollAnchor);
+  } else if (snapshot.scrollTop != null) {
     const scroller = documentScrollerRef.value ?? view.scrollDOM;
     scroller.scrollTop = snapshot.scrollTop;
   }
@@ -603,7 +638,7 @@ defineExpose({
           class="document-scroller"
           @scroll.passive="scheduleDocumentOutlineActiveUpdate"
         >
-          <div class="document-workspace" :class="{ 'has-outline': documentOutlineItems.length > 0 }">
+          <div class="document-workspace" :class="{ 'has-outline': documentOutlineItems.length > 0, 'has-comments': documentComments.hasRailContent.value }">
             <aside
               v-if="documentOutlineItems.length"
               class="document-outline"
@@ -658,6 +693,8 @@ defineExpose({
                   :workspace-ref="workspaceRef"
                   :active="active !== false"
                   :view-mode="editorViewMode"
+                  :comments="documentComments"
+                  :reading-position="readingTarget"
                   auto-grow
                   :min-height="360"
                   transaction-model
@@ -668,6 +705,7 @@ defineExpose({
                 />
               </section>
             </article>
+            <MarkdownCommentRail :controller="documentComments" />
           </div>
         </div>
         <BaseMarkdownEditor

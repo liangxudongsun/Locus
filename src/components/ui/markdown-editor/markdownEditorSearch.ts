@@ -1,7 +1,12 @@
 import { h, render } from "vue";
 import { closeSearchPanel, findNext, findPrevious, getSearchQuery, search, SearchQuery, setSearchQuery } from "@codemirror/search";
 import type { EditorView, Panel, ViewUpdate } from "@codemirror/view";
+import type { EditorState } from "@codemirror/state";
 import FindBar from "../FloatingFindBar.vue";
+import { isInHiddenCommentBlock } from "./markdownCommentEditing";
+
+/** Matches inside the hidden comment block are not part of the visible document. */
+const visibleMatch = (_match: string, state: EditorState, from: number) => !isInHiddenCommentBlock(state, from);
 
 /** Keep CodeMirror's document search and viewport highlights, using our shared controls. */
 export function markdownEditorSearch() {
@@ -26,7 +31,7 @@ function createFindPanel(view: EditorView): Panel {
       anchor: view.dom.closest<HTMLElement>("[data-search-surface]") ?? view.dom,
       query: query.search, count: matches.length, current,
       "onUpdate:query": (value: string) => {
-        view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: value, literal: true })) });
+        view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: value, literal: true, test: visibleMatch })) });
         if (value) {
           // Keep typing stable: prefer the match at the current selection's start.
           const match = matches.find((item) => item.from >= view.state.selection.main.from) ?? matches[0];

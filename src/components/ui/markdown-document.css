@@ -202,6 +202,78 @@
   }
 }
 
+/* Comment rail: the right margin column. Without an outline it appears from
+   1120px, beside an outline from 1400px; narrower pages open comments as
+   popovers. Keep in sync with commentRailMinWidth() in markdownCommentController.ts. */
+.document-comment-rail {
+  display: none;
+  position: relative;
+  min-width: 0;
+}
+
+@container knowledge-document (min-width: 1120px) {
+  .document-workspace.has-comments:not(.has-outline) {
+    display: grid;
+    grid-template-columns: minmax(0, 920px) 272px;
+    column-gap: 20px;
+    align-items: start;
+    justify-content: center;
+    box-sizing: border-box;
+    padding-inline: 24px;
+  }
+
+  .document-workspace.has-comments:not(.has-outline) .document-page {
+    grid-row: 1;
+    grid-column: 1;
+    width: 100%;
+    margin-inline: 0;
+  }
+
+  .document-workspace.has-comments:not(.has-outline) .document-comment-rail {
+    display: block;
+    grid-row: 1;
+    grid-column: 2;
+    align-self: stretch;
+  }
+}
+
+@container knowledge-document (min-width: 1400px) {
+  .document-workspace.has-outline.has-comments {
+    grid-template-columns: 210px minmax(0, 920px) 272px;
+  }
+
+  .document-workspace.has-outline.has-comments .document-page {
+    grid-row: 1;
+  }
+
+  .document-workspace.has-outline.has-comments .document-comment-rail {
+    display: block;
+    grid-row: 1;
+    grid-column: 3;
+    align-self: stretch;
+  }
+}
+
+@container knowledge-document (min-width: 1488px) {
+  .document-workspace.has-comments:not(.has-outline),
+  .document-workspace.has-outline.has-comments {
+    grid-template-columns: minmax(210px, 1fr) minmax(0, 980px) minmax(272px, 1fr);
+    justify-content: normal;
+  }
+
+  .document-workspace.has-comments:not(.has-outline) .document-page {
+    grid-column: 2;
+  }
+
+  .document-workspace.has-comments:not(.has-outline) .document-comment-rail,
+  .document-workspace.has-outline.has-comments .document-comment-rail {
+    grid-column: 3;
+    width: 100%;
+    max-width: 320px;
+    justify-self: start;
+  }
+}
+
 @container knowledge-document (min-width: 1488px) {
   .document-workspace.has-outline {
     grid-template-columns: minmax(210px, 1fr) minmax(0, 980px) minmax(210px, 1fr);

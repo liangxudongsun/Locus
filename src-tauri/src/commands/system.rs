@@ -283,6 +283,8 @@ async fn exit_app_inner(app_handle: AppHandle) {
     }
 
     crate::work_state::save_before_exit(&app_handle).await;
+    // Renderers flushed their pending reading positions before acknowledging.
+    crate::reading_position::flush_on_exit(&app_handle);
 
     if let Some(tasks) = app_handle.try_state::<crate::ActiveTasks>() {
         let tasks = tasks.lock().await;

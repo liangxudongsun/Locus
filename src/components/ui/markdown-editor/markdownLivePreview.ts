@@ -36,6 +36,8 @@ import { markdownLinkHref, markdownLinkIconKind, markdownLinkKeyboard, MarkdownL
 import { Prec } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
 import { frontmatterEnd } from "./markdownFrontmatter";
+import { footnoteKey } from "../../../document/markdownFootnotes";
+import { FootnoteDefinitionLabelWidget, FootnoteReferenceWidget, markdownFootnoteIndex } from "./markdownFootnoteEditing";
 
 function selectionTouches(view: EditorView, from: number, to: number): boolean {
   if (!view.hasFocus || view.state.readOnly) return false;
@@ -258,6 +260,7 @@ const COMPLEX_SCAN_PROTECTED_NAMES = new Set([
   "CodeBlock",
   "HTMLBlock",
   "HTMLTag",
+  "FootnoteReference",
 ]);
 
 function syntaxChildren(node: MarkdownSyntaxNode): MarkdownSyntaxNode[] {
@@ -620,6 +623,50 @@ function buildLivePreviewDecorations(
             );
           }
           return;
+        }
+
+        if (name === "FootnoteReference") {
+          if (selectionTouches(view, from, to)) {
+            add(from, to, Decoration.mark({ class: "cm-live-syntax-marker" }), "footnote-source");
+            return false;
+          }
+          const label = view.state.doc.sliceString(from + 2, to - 1);
+          const key = footnoteKey(label);
+          const index = view.state.field(markdownFootnoteIndex, false);
+          add(from, to, Decoration.replace({
+            widget: new FootnoteReferenceWidget(
+              label,
+              index?.numbers.get(key) ?? null,
+              !!index && !index.definitionByKey.has(key),
+              options.onFootnoteOpen,
+            ),
+          }), "footnote-reference");
+          return false;
+        }
+
+        if (name === "FootnoteDefinition") {
+          let line = view.state.doc.lineAt(from);
+          while (line.from <= to) {
+            addLine(line.from, "cm-live-footnote-definition");
+            if (line.to >= to || line.number >= view.state.doc.lines) break;
+            line = view.state.doc.line(line.number + 1);
+          }
+          return;
+        }
+
+        if (name === "FootnoteDefinitionMark") {
+          const definition = node.parent;
+          if (definition && selectionTouches(view, definition.from, definition.to)) {
+            add(from, to, Decoration.mark({ class: "cm-live-syntax-marker" }), "footnote-definition-source");
+            return false;
+          }
+          const label = view.state.doc.sliceString(from + 2, to - 2);
+          const number = view.state.field(markdownFootnoteIndex, false)?.numbers.get(footnoteKey(label)) ?? null;
+          const after = view.state.doc.sliceString(to, to + 1);
+          add(from, after === " " || after === "\t" ? to + 1 : to, Decoration.replace({
+            widget: new FootnoteDefinitionLabelWidget(label, number),
+          }), "footnote-definition-label");
+          return false;
         }
 
         if (name === "Blockquote") {

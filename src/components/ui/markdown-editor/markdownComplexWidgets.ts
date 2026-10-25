@@ -42,6 +42,8 @@ export interface MarkdownLivePreviewOptions {
     event: PointerEvent,
     element: HTMLElement,
   ) => void;
+  /** Opens a footnote reference shown as a superscript. */
+  onFootnoteOpen?: (target: { key: string; label: string; element: HTMLElement }) => void;
 }
 
 function activateSourceRange(

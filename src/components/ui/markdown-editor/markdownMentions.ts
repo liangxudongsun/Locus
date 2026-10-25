@@ -43,7 +43,7 @@ export function markdownMentionRange(state: EditorState): MentionRange | null {
   }
   const tree = ensureSyntaxTree(state, to, 10) ?? syntaxTree(state);
   for (let node = tree.resolveInner(from, 1); node; node = node.parent!) {
-    if (/^(?:FencedCode|CodeBlock|InlineCode|Link|Image|Autolink|HTMLBlock|HTMLTag|LinkReference)$/.test(node.name)) return null;
+    if (/^(?:FencedCode|CodeBlock|InlineCode|Link|Image|Autolink|HTMLBlock|HTMLTag|LinkReference|CommentBlock|FootnoteReference|FootnoteDefinitionMark)$/.test(node.name)) return null;
   }
   return { from, to, query };
 }

@@ -5,7 +5,7 @@ import type { EditorView } from "@codemirror/view";
 import { nextTick, onBeforeUnmount, ref, shallowRef, useId, watch } from "vue";
 import {
   BetweenHorizontalEnd, BetweenHorizontalStart, BetweenVerticalEnd, BetweenVerticalStart,
-  ClipboardPaste, Copy, History, Redo2, Scissors, SquareDashedMousePointer, TextQuote, Trash2, Undo2,
+  ClipboardPaste, Copy, History, MessageSquarePlus, Redo2, Scissors, SquareDashedMousePointer, Superscript, TextQuote, Trash2, Undo2,
   type IconNode,
 } from "lucide";
 import { t } from "../../../i18n";
@@ -15,11 +15,13 @@ import { normalizeMarkdownEditorLineEndings } from "../markdownEditorFormatting"
 import { captureMarkdownEditorSelection, syncMarkdownDOMSelection, type MarkdownEditorSelection } from "./markdownEditorSelection";
 import { editMarkdownTable, markdownTableTarget, type MarkdownTableAction, type MarkdownTableTarget } from "./markdownTableEditing";
 
-const props = defineProps<{ view: EditorView; canQuote?: boolean; canHistory?: boolean }>();
+const props = defineProps<{ view: EditorView; canQuote?: boolean; canHistory?: boolean; canComment?: boolean; canFootnote?: boolean }>();
 const emit = defineEmits<{
   quoteSelection: [selection: MarkdownEditorSelection];
   actionError: [error: unknown];
   history: [];
+  comment: [];
+  footnote: [];
 }>();
 const position = ref<{ x: number; y: number } | null>(null);
 const menuId = useId();
@@ -102,6 +104,15 @@ function navigateMenu(event: KeyboardEvent): void {
   const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
     : (index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
   buttons[next]?.focus();
+}
+
+function runAnnotation(kind: "comment" | "footnote"): void {
+  const state = capturedState.value;
+  const view = props.view;
+  close();
+  if (!state || view.state !== state) return;
+  if (kind === "comment") emit("comment");
+  else emit("footnote");
 }
 
 function runTable(action: MarkdownTableAction): void {
@@ -214,6 +225,19 @@ defineExpose({ open, onKeydown, close });
       <span>{{ t('editor.quoteSelection') }}</span>
     </button>
     <div v-if="canQuote" class="base-context-menu-separator" role="separator" />
+    <template v-if="(canComment || canFootnote) && !readOnly">
+      <button v-if="canComment" type="button" role="menuitem" data-editor-action="comment" :disabled="!hasSelection" @click="runAnnotation('comment')">
+        <LucideIcon :icon="MessageSquarePlus" :size="13" />
+        <span>{{ t('editor.comment.add') }}</span>
+        <span class="editor-menu-shortcut">Ctrl+Alt+M</span>
+      </button>
+      <button v-if="canFootnote" type="button" role="menuitem" data-editor-action="footnote" @click="runAnnotation('footnote')">
+        <LucideIcon :icon="Superscript" :size="13" />
+        <span>{{ t('editor.footnote.add') }}</span>
+        <span class="editor-menu-shortcut">Ctrl+Alt+F</span>
+      </button>
+      <div class="base-context-menu-separator" role="separator" />
+    </template>
     <template v-for="action in actions" :key="action">
       <div v-if="action === 'cut' || action === 'selectAll'" class="base-context-menu-separator" role="separator" />
       <button

@@ -19,6 +19,7 @@ use tauri::webview::PageLoadEvent;
 use tauri::{Emitter, Manager, WindowEvent};
 
 mod agent;
+mod append_log;
 mod app_tasks;
 pub mod asset_db;
 mod async_tasks;
@@ -35,6 +36,7 @@ pub mod csharp_compile;
 pub mod csharp_lsp;
 mod csv_document;
 pub(crate) mod diff;
+mod document_recovery;
 pub mod dotnet_runtime;
 pub(crate) mod eol;
 pub mod error;
@@ -59,6 +61,7 @@ pub mod process_util;
 pub mod prompt;
 pub mod python_runtime;
 pub mod resource_policy;
+mod reading_position;
 mod runtime_data_lock;
 mod runtime_paths;
 mod sdk;
@@ -69,6 +72,7 @@ mod shared_workbench_window;
 mod unity_embed_webview;
 mod skill_runtime_context;
 mod sqlite_maint;
+mod text_delta;
 mod tool;
 mod user_question;
 pub mod unity_bridge;
@@ -528,6 +532,7 @@ pub fn run() {
             work_state::handle_window_event(window, event);
             if matches!(event, WindowEvent::Destroyed) {
                 if let Some(registry) = window.app_handle().try_state::<Arc<workspace_service::ProjectRegistry>>() {
+                    registry.event_router().window_interests.remove(window.label());
                     for runtime in registry.runtimes() {
                         runtime.core().file_watch().release(window.label(), None);
                     }
@@ -781,6 +786,19 @@ pub fn run() {
                                 last_opened_at: opened_at,
                             },
                         )?;
+                        // Unmanaged checkouts are never re-materialized; a
+                        // nonzero epoch there comes from a legacy import.
+                        if !runtime.is_managed_worktree() && runtime.materialization_epoch() > 0 {
+                            if let Err(error) = registration_store.adopt_pre_import_session_bindings(
+                                runtime.checkout_id().as_str(),
+                                runtime.materialization_epoch(),
+                            ) {
+                                eprintln!(
+                                    "[Locus] failed to adopt pre-import sessions of {}: {error}",
+                                    runtime.checkout_id()
+                                );
+                            }
+                        }
                         workspace_service::restore_or_persist_service_settings(
                             registration_store.as_ref(),
                             runtime,
@@ -800,6 +818,24 @@ pub fn run() {
             let mut recovered_window_contexts = commands::load_window_context_recovery(&data_dir);
             let desktop_work_state = work_state::WorkStateStore::load(&data_dir)?;
             recovered_window_contexts.retain(|context| desktop_work_state.retain_context(context));
+            // Draft recovery lives in the runtime storage directory; earlier
+            // builds wrote it to the config (or app data) directory.
+            let legacy_recovery_dir = runtime_paths::runtime_config_dir_from_env()
+                .ok()
+                .flatten()
+                .or_else(|| app.path().app_data_dir().ok())
+                .map(|dir| dir.join("document-recovery"));
+            let document_recovery = Arc::new(document_recovery::DocumentRecoveryStore::new(
+                data_dir.join("document-recovery"),
+                legacy_recovery_dir.into_iter().collect(),
+            ));
+            {
+                let store = document_recovery.clone();
+                std::thread::spawn(move || store.ensure_ready());
+            }
+            let reading_positions = Arc::new(reading_position::ReadingPositionStore::new(
+                data_dir.join(reading_position::FILE_NAME),
+            ));
             let legacy_active_session_candidates = legacy_active_session_candidates(&data_dir);
             let recovered_main_context = recovered_window_contexts
                 .iter()
@@ -1125,6 +1161,8 @@ pub fn run() {
             app.manage(window_contexts);
             app.manage(window_context_persistence);
             app.manage(desktop_work_state);
+            app.manage(document_recovery);
+            app.manage(reading_positions);
             app.manage(pending_external_script_open);
             app.manage(auth_state);
             app.manage(codex_state);
@@ -1221,7 +1259,7 @@ pub fn run() {
             main_window_builder.build()?;
             if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 if let Some(record) = app.state::<Arc<work_state::WorkStateStore>>().snapshot().windows.get(MAIN_WINDOW_LABEL) {
-                    if let Err(error) = work_state::apply_geometry(&main, record) {
+                    if let Err(error) = work_state::apply_hidden_geometry(&main, record) {
                         eprintln!("[WorkState] main window geometry restore failed: {error}");
                     }
                 }
@@ -1665,6 +1703,7 @@ pub fn run() {
             commands::workspace_file_order_save,
             commands::workspace_file_watch_start,
             commands::workspace_file_watch_stop,
+            workspace_service::event::set_workspace_event_interests,
             commands::csv_view_read,
             commands::csv_view_write,
             commands::csv_file_relocate,
@@ -1739,7 +1778,9 @@ pub fn run() {
             commands::markdown_relative_path,
             commands::markdown_rewrite_image_links,
             commands::markdown_recovery_read,
-            commands::markdown_recovery_write,
+            commands::markdown_recovery_update,
+            reading_position::reading_position_get,
+            reading_position::reading_position_put,
             commands::preview_workspace_file,
             commands::list_app_rules,
             commands::read_app_rule,
@@ -1944,6 +1985,7 @@ pub fn run() {
             workspace_window::open_workspace_window,
             work_state::load_desktop_work_state,
             work_state::save_window_work_state,
+            work_state::save_window_work_state_patch,
             work_state::show_work_state_window,
             work_state::finish_work_state_migration,
             work_state::acknowledge_work_state_save,

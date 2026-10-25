@@ -29,6 +29,7 @@ import {
 } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 import { GFM } from "@lezer/markdown";
+import { markdownFootnoteSyntax } from "./markdownFootnoteSyntax";
 import { normalizeMarkdownEditorLineEndings, shouldPreferMarkdownPlainTextPaste } from "../markdownEditorFormatting";
 import type { MarkdownEditorViewMode } from "../markdownEditorViewMode";
 import {
@@ -53,7 +54,7 @@ export function markdownEditorLanguageExtension(language: MarkdownEditorLanguage
   if (language === "csharp") return [csharp(), lineNumbers()];
   if (language === "plain") return lineNumbers();
   return markdown({
-    extensions: GFM,
+    extensions: [GFM, markdownFootnoteSyntax],
     addKeymap: false,
     completeHTMLTags: false,
   });

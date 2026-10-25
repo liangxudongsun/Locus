@@ -29,6 +29,17 @@ describe("document editing settings", () => {
     expect((await import("../composables/useDocumentEditingSettings")).useDocumentEditingSettings().state.punctuationPairing).toBe(false);
   });
 
+  it("persists a normalized comment author name", async () => {
+    const first = (await import("../composables/useDocumentEditingSettings")).useDocumentEditingSettings();
+    expect(first.state.commentAuthor).toBe("");
+    first.setCommentAuthor("  Enno \n Ruschak  ");
+    expect(first.state.commentAuthor).toBe("Enno Ruschak");
+    vi.resetModules();
+    const second = (await import("../composables/useDocumentEditingSettings")).useDocumentEditingSettings();
+    expect(second.state.commentAuthor).toBe("Enno Ruschak");
+    expect(second.state.punctuationPairing).toBe(false);
+  });
+
   it("updates other windows and returns to disabled when storage is reset", async () => {
     const settings = (await import("../composables/useDocumentEditingSettings")).useDocumentEditingSettings();
     localStorage.setItem(key, JSON.stringify({ punctuationPairing: true }));

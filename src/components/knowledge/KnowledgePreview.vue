@@ -2,7 +2,9 @@
 import type { Text } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { computed, inject, nextTick, onUnmounted, ref, watch } from "vue";
-import type { WorkbenchEditorTransferSnapshot } from "../../types/workbench";
+import type { EditorSnapshotOptions, WorkbenchEditorTransferSnapshot } from "../../types/workbench";
+import type { ReadingTarget } from "../../services/readingPosition";
+import type { ReadingAnchor } from "../../document/readingAnchor";
 import { KNOWLEDGE_QUOTE_SELECTION_KEY, readKnowledgeDocumentSource } from "../../services/knowledgeSelection";
 import { knowledgeSelectionReference } from "./knowledgeSelectionReference";
 import type { MarkdownEditorSelection } from "../ui/markdown-editor/markdownEditorSelection";
@@ -43,6 +45,8 @@ import BaseDropdown from "../ui/BaseDropdown.vue";
 import KnowledgeInjectionAgents from "./KnowledgeInjectionAgents.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
+import MarkdownCommentRail from "../ui/markdown-editor/MarkdownCommentRail.vue";
+import { createMarkdownCommentController } from "../ui/markdown-editor/markdownCommentController";
 import MarkdownProperties from "../ui/MarkdownProperties.vue";
 import { KNOWLEDGE_RESERVED_PROPERTY_KEYS } from "./knowledgeProperties";
 import {
@@ -137,7 +141,12 @@ const bodyDraft = ref("");
 const documentScrollerRef = ref<HTMLElement | null>(null);
 const documentPageRef = ref<HTMLElement | null>(null);
 const documentBodyRef = ref<HTMLElement | null>(null);
-const bodyEditorRef = ref<{ getEditorView: () => EditorView | null } | null>(null);
+const bodyEditorRef = ref<{
+  getEditorView: () => EditorView | null;
+  lastReadingAnchor: () => ReadingAnchor | null;
+  restoreReadingAnchor: (anchor: ReadingAnchor | null) => boolean;
+  cancelReadingRestore: () => void;
+} | null>(null);
 const sectionTextBuffers = new Map<KnowledgeDocumentSection, Text>();
 const baseSectionTexts = new Map<KnowledgeDocumentSection, Text>();
 const fileNameDraft = ref("");
@@ -171,6 +180,8 @@ const localEditorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
 const editorWorkspaceSessions = props.sessionStore ?? localEditorWorkspaceSessions;
 const editorSessions = editorWorkspaceSessions.documents;
 const markdownEditorSessions = editorWorkspaceSessions.markdownEditors;
+/** Comments of the body editor, shown in the page's right margin. */
+const bodyComments = createMarkdownCommentController();
 
 function packageIdForSkillDocument(document: KnowledgeDocument | null | undefined): string {
   if (!document || document.type !== "skill") return "";
@@ -205,6 +216,19 @@ const activeDocumentSessionKey = computed(() =>
 // CodeMirror state follows the same stable document identity as the draft
 // session, so a path rename keeps selection and undo history.
 const documentContentKey = computed(() => activeDocumentSessionKey.value);
+/**
+ * The body's durable reading position follows the document id, which survives
+ * renames and moves. Project documents are shared by the project's worktrees.
+ */
+const readingTarget = computed<ReadingTarget | null>(() => {
+  const document = props.document;
+  if (!document || props.loading) return null;
+  const storage = document.storageSource ?? "project";
+  return {
+    checkoutId: storage === "project" ? props.workspaceRef?.checkoutId ?? null : null,
+    resource: ["knowledge", storage, document.type, document.id || document.path],
+  };
+});
 const documentTitle = computed(() => currentDocumentFileStem.value || t("knowledge.preview.untitled"));
 const titleMeasureText = computed(() => fileNameDraft.value || " ");
 const typeLabel = computed(() => labelForType(props.document?.type));
@@ -711,31 +735,43 @@ onUnmounted(() => {
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
 });
 
-function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
+function exportTransferSnapshot(options: EditorSnapshotOptions = {}): WorkbenchEditorTransferSnapshot {
   if (!props.document || props.loading) return { kind: "resource" };
   captureEditorSession();
   const session = editorSessions.get(activeDocumentSessionKey.value);
   if (!session) return { kind: "resource" };
   const view = bodyEditorRef.value?.getEditorView();
+  // Saved work state restores a saved document from disk; drafts are kept only while unsaved or conflicted.
+  const unsaved = session.dirtySections.size > 0 || session.saveBlockedSections.size > 0 || session.fileNameDirty
+    || Object.values(session.sectionConflicts).some((items) => items.length > 0);
   return { kind: "knowledge", documentId: props.document.id,
-    session: serializeKnowledgeDocumentSession(session),
+    ...(!options.workState || unsaved ? { session: serializeKnowledgeDocumentSession(session) } : {}),
     selection: view ? { anchor: view.state.selection.main.anchor, head: view.state.selection.main.head } : null,
-    scrollTop: view?.scrollDOM.scrollTop,
+    // The body grows with its content; the document scroller is what scrolls.
+    scrollTop: documentScrollerRef.value?.scrollTop,
+    scrollAnchor: bodyEditorRef.value?.lastReadingAnchor() ?? null,
   };
 }
 
 async function restoreWorkState(snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean> {
   if (snapshot.kind !== "knowledge" || props.document?.id !== snapshot.documentId || props.loading) return false;
-  editorSessions.set(activeDocumentSessionKey.value, deserializeKnowledgeDocumentSession(snapshot.session));
-  // Reuse the existing three-way rebase and conflict UI when disk content changed.
-  restoreEditorSession(activeDocumentSessionKey.value, props.document);
+  if (snapshot.session) {
+    editorSessions.set(activeDocumentSessionKey.value, deserializeKnowledgeDocumentSession(snapshot.session));
+    // Reuse the existing three-way rebase and conflict UI when disk content changed.
+    restoreEditorSession(activeDocumentSessionKey.value, props.document);
+  }
   await nextTick();
   const view = bodyEditorRef.value?.getEditorView();
   if (view && snapshot.selection) view.dispatch({ selection: {
     anchor: Math.min(view.state.doc.length, Math.max(0, snapshot.selection.anchor)),
     head: Math.min(view.state.doc.length, Math.max(0, snapshot.selection.head)),
   } });
-  if (view && snapshot.scrollTop != null) view.scrollDOM.scrollTop = snapshot.scrollTop;
+  if (snapshot.scrollAnchor) {
+    bodyEditorRef.value?.restoreReadingAnchor(snapshot.scrollAnchor);
+  } else if (snapshot.scrollTop != null && documentScrollerRef.value) {
+    bodyEditorRef.value?.cancelReadingRestore();
+    documentScrollerRef.value.scrollTop = snapshot.scrollTop;
+  }
   return true;
 }
 
@@ -1595,7 +1631,7 @@ function labelForProvider(provider?: string | null): string {
           <div
             v-else
             class="document-workspace"
-            :class="{ 'has-outline': documentOutlineItems.length > 0 }"
+            :class="{ 'has-outline': documentOutlineItems.length > 0, 'has-comments': bodyComments.hasRailContent.value }"
           >
             <aside
               v-if="documentOutlineItems.length"
@@ -1930,6 +1966,7 @@ function labelForProvider(provider?: string | null): string {
                 </div>
                 <BaseMarkdownEditor
                   ref="bodyEditorRef"
+                  :comments="bodyComments"
                   :search-priority="2"
                   :model-value="bodyDraft"
                   :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
@@ -1944,6 +1981,7 @@ function labelForProvider(provider?: string | null): string {
                   :view-mode="editorViewMode"
                   :content-path="documentPath"
                   :content-key="`${documentContentKey}:body`"
+                  :reading-position="readingTarget"
                   :saved-value="baseDrafts.body"
                   :resource-path="documentFilePath"
                   auto-grow
@@ -1958,6 +1996,7 @@ function labelForProvider(provider?: string | null): string {
                 />
             </section>
             </article>
+            <MarkdownCommentRail :controller="bodyComments" />
           </div>
         </div>
       </div>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { Compartment, EditorSelection, EditorState, StateEffect, Transaction, type Extension } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { Compartment, EditorSelection, EditorState, Prec, StateEffect, Transaction, type Extension, type Text } from "@codemirror/state";
+import { EditorView, keymap } from "@codemirror/view";
 import { openSearchPanel } from "@codemirror/search";
 import { useSearchScope } from "../../composables/useSearchScope";
 import { markdownEditorSearch } from "./markdown-editor/markdownEditorSearch";
@@ -19,6 +19,12 @@ import { markdownMentions } from "./markdown-editor/markdownMentions";
 import { getLocusRuntime } from "../../services/locusRuntime";
 import { rebaseDocumentText } from "../../document/documentText";
 import MarkdownEditorControls from "./markdown-editor/MarkdownEditorControls.vue";
+import MarkdownCommentPopover from "./markdown-editor/MarkdownCommentPopover.vue";
+import MarkdownFootnotePopover from "./markdown-editor/MarkdownFootnotePopover.vue";
+import { markdownCommentExtensions } from "./markdown-editor/markdownCommentEditing";
+import type { MarkdownCommentController } from "./markdown-editor/markdownCommentController";
+import { insertMarkdownFootnote, markdownFootnoteExtensions } from "./markdown-editor/markdownFootnoteEditing";
+import type { FloatingAnchorRect } from "./markdown-editor/markdownFloating";
 import MarkdownProperties from "./MarkdownProperties.vue";
 import { markdownFrontmatterField, markdownFrontmatterHiding, type MarkdownFrontmatter } from "./markdown-editor/markdownFrontmatter";
 import { isolateHistory } from "@codemirror/commands";
@@ -53,13 +59,47 @@ import type { WorkspaceRef } from "../../services/project";
 import { subscribeWorkspaceFileChanges } from "../../services/workspaceExplorer";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { useTextViewerZoom } from "../../composables/useTextViewerZoom";
-import { workspaceFileChangeMatches } from "../../composables/useFileChangeRevalidation";
+import { workspaceFileChangeInScope } from "../../composables/useFileChangeRevalidation";
 import { useDocumentEditingSettings } from "../../composables/useDocumentEditingSettings";
 import { markdownPunctuationPairing } from "./markdown-editor/markdownPunctuationPairing";
+import {
+  captureReadingAnchor as captureAnchorAt,
+  restoreReadingAnchor as restoreAnchorAt,
+  type ReadingAnchor,
+} from "../../document/readingAnchor";
+import {
+  getReadingPosition,
+  putReadingPosition,
+  readingTargetKey,
+  registerReadingPositionCapture,
+  type ReadingTarget,
+} from "../../services/readingPosition";
 
-const workspaceMarkdownImageResolver: MarkdownImageResolver = (source, context) => {
+import { markdownDependencyPath } from "../../composables/markdownFileDependencies";
+
+// Track only images that have actually entered the preview cache. This also
+// retains off-screen image dependencies without scanning the editor document
+// on every filesystem event. Absolute paths use conservative suffix matching
+// because this component has a WorkspaceRef but no checkout root.
+let imageReferences = new Set<string>();
+function rememberImageReference(references: Set<string>, source: string, contentPath = "") {
+  const relative = markdownDependencyPath(source, "", contentPath, true);
+  if (relative) { references.add(relative); return; }
+  let path = source.replace(/\\/g, "/")
+    .replace(/^file:\/\//i, "").replace(/^\/([a-z]:\/)/i, "$1").replace(/[?#].*$/, "");
+  try { path = decodeURIComponent(path); } catch { /* Literal path. */ }
+  const absolute = relativeMarkdownPath(contentPath, path);
+  if (/^(?:[a-z]:\/|\/)/i.test(absolute)) references.add(absolute.toLocaleLowerCase());
+}
+const workspaceMarkdownImageResolver: MarkdownImageResolver = async (source, context) => {
   if (!context.workspaceRef) return null;
-  return resolveMarkdownImage(context.workspaceRef, source, context.contentPath);
+  const references = imageReferences;
+  // The backend supports both document-relative and workspace-relative paths.
+  rememberImageReference(references, source);
+  rememberImageReference(references, source, context.contentPath);
+  const resolved = await resolveMarkdownImage(context.workspaceRef, source, context.contentPath);
+  references.add(resolved.displayPath.replace(/\\/g, "/").toLocaleLowerCase());
+  return resolved;
 };
 
 const props = withDefaults(defineProps<{
@@ -87,7 +127,17 @@ const props = withDefaults(defineProps<{
    * model is materialized at an explicit shortcut-save boundary.
    */
   transactionModel?: boolean;
+  /**
+   * Durable reading position of the shown document. Restored when no session
+   * of this editor exists; recorded when scrolling settles, on hide and on exit.
+   * Set it only once the document content is loaded.
+   */
+  readingPosition?: ReadingTarget | null;
+  /** Comment UI of this editor; without it comments stay hidden but intact. */
+  comments?: MarkdownCommentController | null;
 }>(), {
+  readingPosition: null,
+  comments: null,
   disabled: false,
   placeholder: "",
   viewMode: "rendered",
@@ -156,9 +206,68 @@ const modeCompartment = new Compartment();
 const readOnlyCompartment = new Compartment();
 const placeholderCompartment = new Compartment();
 const punctuationCompartment = new Compartment();
+const annotationCompartment = new Compartment();
+
+interface FootnotePopoverState {
+  key: string;
+  label: string;
+  anchor: FloatingAnchorRect;
+  insertedDoc: Text | null;
+}
+const footnotePopover = shallowRef<FootnotePopoverState | null>(null);
+
+function annotationExtensions(): Extension {
+  if (currentLanguage() !== "markdown") return [];
+  return [
+    markdownFootnoteExtensions(),
+    markdownCommentExtensions({ hideBlock: props.viewMode === "rendered", sync: props.comments ?? null }),
+    Prec.high(keymap.of([
+      { key: "Mod-Alt-m", run: () => startComment() },
+      { key: "Mod-Alt-f", run: () => insertFootnoteAtCursor() },
+    ])),
+  ];
+}
+
+function openFootnote(target: { key: string; label: string; element: HTMLElement }): void {
+  const rect = target.element.getBoundingClientRect();
+  footnotePopover.value = {
+    key: target.key,
+    label: target.label,
+    anchor: { left: rect.left, top: rect.top, bottom: rect.bottom },
+    insertedDoc: null,
+  };
+}
+
+function insertFootnoteAtCursor(): boolean {
+  const view = editorView;
+  if (!view || view.state.readOnly || currentLanguage() !== "markdown") return false;
+  const key = insertMarkdownFootnote(view);
+  if (!key) return false;
+  const insertedDoc = view.state.doc;
+  view.requestMeasure({
+    read: () => view.coordsAtPos(view.state.selection.main.head),
+    write: (coords) => {
+      if (editorView !== view || view.state.doc !== insertedDoc) return;
+      const rect = coords ?? view.contentDOM.getBoundingClientRect();
+      footnotePopover.value = { key, label: key, anchor: { left: rect.left, top: rect.top, bottom: rect.bottom }, insertedDoc };
+    },
+  });
+  return true;
+}
+
+function startComment(): boolean {
+  const controller = props.comments;
+  if (!controller || !editorView || editorView.state.readOnly) return false;
+  const result = controller.startDraft();
+  if (result === "empty") useNotificationStore().addNotice("info", t("editor.comment.emptySelection"));
+  else if (result === "tooLong") useNotificationStore().addNotice("warning", t("editor.comment.selectionTooLong"));
+  else if (result === "readOnly" && !controller.writable.value) useNotificationStore().addNotice("info", t("editor.comment.readOnlyFormat"));
+  return result !== "readOnly";
+}
 const { state: documentEditingSettings } = useDocumentEditingSettings();
 const localSessionCache = new MarkdownEditorSessionCache();
 const imageCacheEpoch = ref(0);
+let imageRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const {
   textViewerZoomScale,
   textViewerZoomStyle,
@@ -179,6 +288,17 @@ let removeScrollTracking: (() => void) | null = null;
 let activeScrollElement: HTMLElement | null = null;
 let releaseWorkspaceFileChanges: RuntimeUnsubscribe | null = null;
 let editorUnmounted = false;
+const READING_CAPTURE_DELAY_MS = 1000;
+/** Reading target of the document currently in the view. */
+let readingTarget: ReadingTarget | null = null;
+let readingCaptureTimer: ReturnType<typeof setTimeout> | null = null;
+/** Bumped to abandon a pending restore; a restore applies only for its own token. */
+let readingRestoreToken = 0;
+let readingRestorePending = false;
+/** Shown without a session before its reading target was known. */
+let readingRestoreAwaitingTarget = false;
+let lastReadingAnchor: ReadingAnchor | null = null;
+let releaseReadingCapture: (() => void) | null = null;
 const physicalPath = computed(() => props.resourcePath || props.contentPath);
 const recovery = useDocumentRecovery({
   key: () => JSON.stringify([props.workspaceRef?.checkoutId ?? "local", props.workspaceRef?.expectedMaterializationEpoch ?? 0, physicalPath.value, props.contentKey.match(/:(body|summary|maintenanceRules)$/)?.[1] ?? "body"]),
@@ -300,6 +420,7 @@ function currentLivePreviewOptions(): MarkdownLivePreviewOptions {
     onReferenceOpen: handleReferenceOpen,
     onReferencePointerDown: handleReferencePointerDown,
     onLinkOpen: openLink,
+    onFootnoteOpen: openFootnote,
   };
   if (!workspaceRef) return options;
   return {
@@ -381,6 +502,7 @@ function editorExtensions(): Extension[] {
     readOnlyCompartment.of(markdownEditorReadOnlyExtension(props.disabled)),
     placeholderCompartment.of(markdownEditorPlaceholderExtension(props.placeholder)),
     punctuationCompartment.of(punctuationExtensions()),
+    annotationCompartment.of(annotationExtensions()),
     EditorView.domEventHandlers({
       compositionstart: handleCompositionStart,
       compositionend: handleCompositionEnd,
@@ -427,6 +549,7 @@ function configurationEffects() {
     readOnlyCompartment.reconfigure(markdownEditorReadOnlyExtension(props.disabled)),
     placeholderCompartment.reconfigure(markdownEditorPlaceholderExtension(props.placeholder)),
     punctuationCompartment.reconfigure(punctuationExtensions()),
+    annotationCompartment.reconfigure(annotationExtensions()),
   ];
 }
 
@@ -523,10 +646,18 @@ function startScrollTracking(view: EditorView): void {
   const handleScroll = () => {
     currentScrollTop = scrollElement.scrollTop;
     currentScrollLeft = scrollElement.scrollLeft;
+    scheduleReadingCapture();
   };
+  // The user taking over the viewport abandons a pending reading restore.
+  const handleUserScroll = () => {
+    if (readingRestorePending || readingRestoreAwaitingTarget) cancelReadingRestore();
+  };
+  const userEvents = ["wheel", "pointerdown", "keydown", "touchstart"] as const;
   scrollElement.addEventListener("scroll", handleScroll, { passive: true });
+  for (const type of userEvents) scrollElement.addEventListener(type, handleUserScroll, { passive: true });
   removeScrollTracking = () => {
     scrollElement.removeEventListener("scroll", handleScroll);
+    for (const type of userEvents) scrollElement.removeEventListener(type, handleUserScroll);
     if (activeScrollElement === scrollElement) activeScrollElement = null;
     removeScrollTracking = null;
   };
@@ -536,6 +667,69 @@ function restoreTrackedScroll(view: EditorView, top: number, left: number): void
   const scrollElement = activeScrollElement ?? resolveScrollElement(view);
   scrollElement.scrollTop = top;
   scrollElement.scrollLeft = left;
+}
+
+/** Anchor at the viewport top; undefined while it is unknown (no view, restore pending). */
+function captureReadingNow(): ReadingAnchor | null | undefined {
+  const view = editorView;
+  if (!view || !readingTarget || readingRestorePending) return undefined;
+  return captureAnchorAt(view, activeScrollElement ?? resolveScrollElement(view));
+}
+
+function storeReadingPosition(): void {
+  if (readingCaptureTimer !== null) clearTimeout(readingCaptureTimer);
+  readingCaptureTimer = null;
+  const anchor = captureReadingNow();
+  if (anchor === undefined || !readingTarget) return;
+  lastReadingAnchor = anchor;
+  putReadingPosition(readingTarget, anchor);
+}
+
+function scheduleReadingCapture(): void {
+  if (!readingTarget || readingRestorePending) return;
+  if (readingCaptureTimer !== null) clearTimeout(readingCaptureTimer);
+  readingCaptureTimer = setTimeout(storeReadingPosition, READING_CAPTURE_DELAY_MS);
+}
+
+/** Explicit navigation or user scrolling wins over a restore still in flight. */
+function cancelReadingRestore(): void {
+  readingRestoreToken += 1;
+  readingRestorePending = false;
+  readingRestoreAwaitingTarget = false;
+}
+
+/** Restores the durable position of a document shown without an editor session. */
+function requestReadingRestore(view: EditorView): void {
+  readingRestoreToken += 1;
+  readingRestorePending = false;
+  const target = readingTarget;
+  // The document may still be loading; restore once its target is known.
+  readingRestoreAwaitingTarget = !target;
+  if (!target) return;
+  const token = readingRestoreToken;
+  readingRestorePending = true;
+  void getReadingPosition(target).then((anchor) => {
+    if (token !== readingRestoreToken) return;
+    readingRestorePending = false;
+    if (editorView !== view) return;
+    lastReadingAnchor = anchor;
+    if (anchor) restoreAnchorAt(view, activeScrollElement ?? resolveScrollElement(view), anchor);
+    else restoreTrackedScroll(view, 0, 0);
+  });
+}
+
+function restoreReadingAnchor(anchor: ReadingAnchor | null): boolean {
+  const view = editorView;
+  if (!view) return false;
+  cancelReadingRestore();
+  lastReadingAnchor = anchor;
+  if (!anchor) return true;
+  return restoreAnchorAt(view, activeScrollElement ?? resolveScrollElement(view), anchor);
+}
+
+function bindReadingTarget(): void {
+  readingTarget = props.readingPosition ?? null;
+  lastReadingAnchor = null;
 }
 
 function stateWithSessionModel(
@@ -555,6 +749,7 @@ function stateWithSessionModel(
 
 function restoreSession(contentKey: string, nextModelValue: string, previousModelValue: string): void {
   contextMenuRef.value?.close(false);
+  footnotePopover.value = null;
   const view = editorView;
   if (!view) {
     activeSessionKey = normalizeSessionKey(contentKey);
@@ -563,6 +758,8 @@ function restoreSession(contentKey: string, nextModelValue: string, previousMode
 
   resetCompositionState(true);
   resetSelectionChange();
+  storeReadingPosition();
+  cancelReadingRestore();
   saveActiveSession(previousModelValue, activeSessionPinned);
   activeSessionKey = normalizeSessionKey(contentKey);
   activeSessionCache = props.sessionCache ?? localSessionCache;
@@ -577,16 +774,19 @@ function restoreSession(contentKey: string, nextModelValue: string, previousMode
     : createEditorState(nextModelValue);
   view.setState(nextState);
   frontmatter.value = nextState.field(markdownFrontmatterField, false) ?? null;
+  bindReadingTarget();
 
   const scrollTop = cached?.scrollTop ?? 0;
   const scrollLeft = cached?.scrollLeft ?? 0;
   currentScrollTop = scrollTop;
   currentScrollLeft = scrollLeft;
   const restoredKey = activeSessionKey;
+  // A session in memory is exact; otherwise use the durable reading position.
+  if (!cached) requestReadingRestore(view);
   view.requestMeasure({
     read: () => null,
     write() {
-      if (!editorView || activeSessionKey !== restoredKey) return;
+      if (!editorView || activeSessionKey !== restoredKey || readingRestorePending) return;
       restoreTrackedScroll(editorView, scrollTop, scrollLeft);
     },
   });
@@ -607,16 +807,18 @@ function mountEditor(): void {
   frontmatter.value = state.field(markdownFrontmatterField, false) ?? null;
   controlsView.value = editorView;
   startScrollTracking(editorView);
+  bindReadingTarget();
 
   const scrollTop = cached?.scrollTop ?? 0;
   const scrollLeft = cached?.scrollLeft ?? 0;
   currentScrollTop = scrollTop;
   currentScrollLeft = scrollLeft;
   const restoredKey = activeSessionKey;
+  if (!cached) requestReadingRestore(editorView);
   editorView.requestMeasure({
     read: () => null,
     write() {
-      if (!editorView || activeSessionKey !== restoredKey) return;
+      if (!editorView || activeSessionKey !== restoredKey || readingRestorePending) return;
       restoreTrackedScroll(editorView, scrollTop, scrollLeft);
     },
   });
@@ -624,9 +826,12 @@ function mountEditor(): void {
 
 function suspendEditor(): void {
   if (!editorView) return;
+  footnotePopover.value = null;
   // A hidden tab keeps its last selection; deliver one that is still settling.
   if (selectionChangeTimer) emitSelectionChange();
   resetCompositionState(true);
+  storeReadingPosition();
+  cancelReadingRestore();
   saveActiveSession();
   removeScrollTracking?.();
   editorView.destroy();
@@ -660,6 +865,8 @@ function handleContextMenuError(error: unknown): void {
 
 onMounted(() => {
   mountEditor();
+  // App exit records the position of the visible document.
+  releaseReadingCapture = registerReadingPositionCapture(storeReadingPosition);
   if (hasSelectionListener()) {
     selectionDocument = mountRef.value?.ownerDocument ?? null;
     selectionDocument?.addEventListener("selectionchange", handleDocumentSelectionChange);
@@ -683,17 +890,34 @@ onMounted(() => {
     } catch (error) { handleContextMenuError(error); }
   }).then(release => { if (editorUnmounted) release(); else releaseImageRenames = release; }).catch(handleContextMenuError);
   void subscribeWorkspaceFileChanges((event) => {
-    if (!workspaceFileChangeMatches(event, props.workspaceRef, event.payload.path)) return;
-    if (!/\.(?:png|jpe?g|gif|bmp|webp|svg)$/i.test(event.payload.path)) return;
-    const source = (editorView?.state.doc.toString() ?? props.modelValue).replace(/\\/g, "/");
-    if (!source.toLocaleLowerCase().includes(event.payload.path.toLocaleLowerCase())) return;
-    imageCacheEpoch.value += 1;
-    reconfigureEditor();
-  }).then((release) => {
+    if (!workspaceFileChangeInScope(event, props.workspaceRef) || !imageReferences.size) return;
+    const path = event.payload.path.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "").toLocaleLowerCase();
+    if (path !== "." && ![...imageReferences].some(reference => reference === path
+      || reference.startsWith(`${path}/`) || reference.endsWith(`/${path}`) || reference.includes(`/${path}/`))) return;
+    if (imageRefreshTimer !== null) return;
+    imageRefreshTimer = setTimeout(() => {
+      imageRefreshTimer = null;
+      if (editorUnmounted) return;
+      imageCacheEpoch.value += 1;
+      reconfigureEditor();
+    }, 100);
+  }, () => props.workspaceRef).then((release) => {
     if (editorUnmounted) release();
     else releaseWorkspaceFileChanges = release;
   });
 });
+
+watch(
+  () => [props.contentKey, physicalPath.value, props.workspaceRef?.checkoutId,
+    props.workspaceRef?.expectedGeneration, props.workspaceRef?.expectedMaterializationEpoch],
+  () => {
+    imageReferences = new Set();
+    imageCacheEpoch.value += 1;
+    if (imageRefreshTimer !== null) clearTimeout(imageRefreshTimer);
+    imageRefreshTimer = null;
+  },
+  { flush: "sync" },
+);
 
 watch(
   () => props.active,
@@ -724,6 +948,7 @@ watch(
   () => [
     props.viewMode,
     documentEditingSettings.punctuationPairing,
+    props.comments,
     props.showProperties,
     props.disabled,
     props.placeholder,
@@ -771,14 +996,48 @@ onBeforeUnmount(() => {
   selectionChangeTimer = null;
   releaseWorkspaceFileChanges?.();
   releaseWorkspaceFileChanges = null;
+  if (imageRefreshTimer !== null) clearTimeout(imageRefreshTimer);
+  imageRefreshTimer = null;
   releaseImageRenames?.();
   suspendEditor();
+  releaseReadingCapture?.();
+  releaseReadingCapture = null;
+  if (readingCaptureTimer !== null) clearTimeout(readingCaptureTimer);
+  readingCaptureTimer = null;
   localSessionCache.clear();
 });
+
+// A renamed document keeps its reading position under the new identity.
+watch(
+  () => props.readingPosition ? readingTargetKey(props.readingPosition) : "",
+  (next, previous) => {
+    const target = props.readingPosition ?? null;
+    const old = readingTarget;
+    // A content switch already bound the new target.
+    if (!editorView || next === previous || (old ? readingTargetKey(old) : "") === next) return;
+    readingTarget = target;
+    if (!old && target && readingRestoreAwaitingTarget) {
+      requestReadingRestore(editorView);
+      return;
+    }
+    if (!old || !target || readingRestorePending) return;
+    const anchor = captureReadingNow();
+    if (anchor === undefined) return;
+    putReadingPosition(target, anchor);
+    putReadingPosition(old, null);
+  },
+  { flush: "post" },
+);
 
 defineExpose({
   getEditorView: () => editorView,
   getBodyElement: () => mountRef.value,
+  /** Fresh anchor at the viewport top; null at the top or without a view. */
+  captureReadingAnchor: (): ReadingAnchor | null => captureReadingNow() ?? null,
+  /** Last anchor recorded or restored, without reading layout. */
+  lastReadingAnchor: (): ReadingAnchor | null => lastReadingAnchor,
+  restoreReadingAnchor,
+  cancelReadingRestore,
 });
 </script>
 
@@ -822,7 +1081,18 @@ defineExpose({
       @shortcut-save="emitShortcutSave"
     />
     <div ref="mountRef" class="base-markdown-editor-host" @contextmenu="contextMenuRef?.open($event)" @keydown="contextMenuRef?.onKeydown($event)" />
-    <MarkdownEditorContextMenu v-if="controlsView" ref="contextMenuRef" :view="controlsView" :can-history="!!physicalPath && currentLanguage() === 'markdown'" :can-quote="canQuoteSelection" @history="recovery.openHistory" @quote-selection="emit('quoteSelection', $event)" @action-error="handleContextMenuError" />
+    <MarkdownEditorContextMenu v-if="controlsView" ref="contextMenuRef" :view="controlsView" :can-history="!!physicalPath && currentLanguage() === 'markdown'" :can-quote="canQuoteSelection" @history="recovery.openHistory" @quote-selection="emit('quoteSelection', $event)" @action-error="handleContextMenuError" :can-comment="!!comments && currentLanguage() === 'markdown' && !disabled" :can-footnote="currentLanguage() === 'markdown' && !disabled" @comment="startComment" @footnote="insertFootnoteAtCursor" />
+    <MarkdownCommentPopover v-if="comments && controlsView && currentLanguage() === 'markdown'" :controller="comments" />
+    <MarkdownFootnotePopover
+      v-if="footnotePopover && controlsView"
+      :key="`${footnotePopover.key}:${footnotePopover.anchor.left}:${footnotePopover.anchor.top}`"
+      :view="controlsView"
+      :footnote-key="footnotePopover.key"
+      :label="footnotePopover.label"
+      :anchor="footnotePopover.anchor"
+      :inserted-doc="footnotePopover.insertedDoc"
+      @close="footnotePopover = null"
+    />
     <MarkdownEditorControls v-if="controlsView && viewMode === 'rendered' && currentLanguage() === 'markdown' && !disabled" :key="contentKey" ref="controlsRef" :view="controlsView" :workspace-ref="workspaceRef" :content-path="physicalPath" />
   </div>
 </template>
