@@ -24,11 +24,18 @@ use serde::{Deserialize, Serialize};
 use super::state_probe::SemanticState;
 use super::unix_now_ms;
 
+mod timeline;
+pub use timeline::UnityStallAssessment;
+
 /// Error code carried by Unity requests that were interrupted because the
 /// user restarted an unresponsive Editor. Callers must not retry/reattach.
 pub(crate) const UNITY_RESTART_INTERRUPT_CODE: &str = "unity_restarted_by_user";
 
 const BROKER_STACK_CAPABILITY: &str = "broker_main_thread_stack_v1";
+/// Brokers that cache managed names per domain generation. Only these get
+/// timeline sampling: an older broker would attach a Mono thread per sample.
+const BROKER_NAME_CACHE_CAPABILITY: &str = "broker_stack_name_cache_v1";
+const TIMELINE_CAPTURE_REQUEST: &str = r#"{"samples":1,"intervalMs":10,"maxFrames":96}"#;
 const BROKER_CAPTURE_TIMEOUT: Duration = Duration::from_secs(12);
 const EXTERNAL_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 const SYMBOLIZE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -105,6 +112,10 @@ pub struct UnityHangDiagnosis {
     pub notes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Timeline assessment of the incident (sampled every 5-30s while the
+    /// main thread stays unresponsive). Absent until two samples exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall: Option<UnityStallAssessment>,
 }
 
 impl UnityHangDiagnosis {
@@ -129,6 +140,7 @@ impl UnityHangDiagnosis {
             frames: Vec::new(),
             notes: Vec::new(),
             error: None,
+            stall: None,
         }
     }
 
@@ -159,6 +171,8 @@ struct CaptureTarget {
     created: Option<u64>,
     thread_id: Option<u32>,
     broker_stack: bool,
+    /// The broker caches managed names, so repeated samples stay cheap.
+    name_cache: bool,
     heartbeat_age_ms: Option<u64>,
     active_executions: Option<u32>,
     editor_dir: Option<String>,
@@ -175,6 +189,11 @@ struct Incident {
     completed_at_ms: Option<u64>,
     target: CaptureTarget,
     diagnosis: Option<UnityHangDiagnosis>,
+    /// Latest timeline assessment; merged into the attached diagnosis.
+    stall: Option<UnityStallAssessment>,
+    /// Identifies the timeline sampler that owns `stall`; bumped whenever a
+    /// new sampler starts (new incident or re-entry into `unresponsive`).
+    timeline_epoch: u64,
 }
 
 fn incidents() -> &'static Mutex<HashMap<String, Incident>> {
@@ -196,6 +215,7 @@ pub(super) fn note_semantic_state(
     let key = super::project_runtime_key(project_path);
     let now = unix_now_ms();
     let mut spawn = None;
+    let mut spawn_timeline = None;
     if let Ok(mut store) = incidents().lock() {
         if is_unresponsive(state) {
             let pid = state.process.pid.unwrap_or_default();
@@ -212,6 +232,12 @@ pub(super) fn note_semantic_state(
                             .iter()
                             .chain(status.capabilities.iter())
                             .any(|capability| capability == BROKER_STACK_CAPABILITY)
+                }),
+                name_cache: broker.is_some_and(|status| {
+                    status
+                        .broker_capabilities
+                        .iter()
+                        .any(|capability| capability == BROKER_NAME_CACHE_CAPABILITY)
                 }),
                 heartbeat_age_ms: state.main_thread.heartbeat_age_ms,
                 active_executions: state.main_thread.active_executions,
@@ -231,10 +257,16 @@ pub(super) fn note_semantic_state(
                         && entry.created == created
                         && entry.completed_at_ms.is_some_and(|done| now.saturating_sub(done) < REUSE_DIAGNOSIS_MS) =>
                 {
+                    // Reuse the stack report, but measure the new stall afresh.
                     entry.active = true;
+                    entry.stall = None;
+                    entry.timeline_epoch += 1;
+                    entry.target.heartbeat_age_ms = target.heartbeat_age_ms;
+                    spawn_timeline = Some((entry.timeline_epoch, target));
                 }
                 existing => {
-                    let generation = existing.map(|entry| entry.generation + 1).unwrap_or(1);
+                    let generation = existing.as_ref().map(|entry| entry.generation + 1).unwrap_or(1);
+                    let timeline_epoch = existing.map(|entry| entry.timeline_epoch + 1).unwrap_or(1);
                     store.insert(
                         key.clone(),
                         Incident {
@@ -247,8 +279,11 @@ pub(super) fn note_semantic_state(
                             completed_at_ms: None,
                             target: target.clone(),
                             diagnosis: None,
+                            stall: None,
+                            timeline_epoch,
                         },
                     );
+                    spawn_timeline = Some((timeline_epoch, target.clone()));
                     spawn = Some((generation, target));
                 }
             }
@@ -260,6 +295,14 @@ pub(super) fn note_semantic_state(
         let project = project_path.to_string();
         tauri::async_runtime::spawn(async move {
             run_incident(project, generation, target).await;
+        });
+    }
+    if let Some((epoch, target)) =
+        spawn_timeline.filter(|(_, target)| target.broker_stack && target.name_cache)
+    {
+        let project = project_path.to_string();
+        tauri::async_runtime::spawn(async move {
+            run_timeline(project, epoch, target).await;
         });
     }
     attach(project_path, state);
@@ -290,7 +333,153 @@ fn current_diagnosis(entry: &Incident) -> UnityHangDiagnosis {
     if entry.target.heartbeat_age_ms.is_some() {
         diagnosis.heartbeat_age_ms = entry.target.heartbeat_age_ms;
     }
+    diagnosis.stall = entry.stall.clone();
     diagnosis
+}
+
+// ── Timeline sampling ───────────────────────────────────────────────────────
+
+fn timeline_is_current(project_path: &str, epoch: u64) -> bool {
+    let key = super::project_runtime_key(project_path);
+    incidents()
+        .lock()
+        .ok()
+        .and_then(|store| {
+            store
+                .get(&key)
+                .map(|entry| entry.active && entry.timeline_epoch == epoch)
+        })
+        .unwrap_or(false)
+}
+
+fn store_timeline_assessment(project_path: &str, epoch: u64, assessment: UnityStallAssessment) {
+    let key = super::project_runtime_key(project_path);
+    if let Ok(mut store) = incidents().lock() {
+        if let Some(entry) = store.get_mut(&key).filter(|entry| entry.timeline_epoch == epoch) {
+            if entry.stall.as_ref().map(|stall| &stall.kind) != Some(&assessment.kind) {
+                tracing::info!(
+                    log_module = "Locus",
+                    "Unity stall assessment for pid {}: {} ({} samples, max suspend {}us)",
+                    entry.pid,
+                    timeline::describe(&assessment),
+                    assessment.samples,
+                    assessment.max_suspend_us.unwrap_or(0)
+                );
+            }
+            entry.stall = Some(assessment);
+        }
+    }
+}
+
+/// Sample the main thread while this incident stays unresponsive. Stops as
+/// soon as the observer sees the editor loop again (checked every second).
+async fn run_timeline(project_path: String, epoch: u64, target: CaptureTarget) {
+    let mut samples: std::collections::VecDeque<timeline::TimelineSample> =
+        std::collections::VecDeque::with_capacity(timeline::MAX_RETAINED);
+    let mut taken = 0u32;
+    while timeline_is_current(&project_path, epoch) {
+        match capture_timeline_sample(&project_path, target.pid).await {
+            Ok(sample) => {
+                if samples.len() >= timeline::MAX_RETAINED {
+                    samples.pop_front();
+                }
+                samples.push_back(sample);
+                let ordered: Vec<_> = samples.iter().cloned().collect();
+                if let Some(assessment) = timeline::assess(&ordered) {
+                    store_timeline_assessment(&project_path, epoch, assessment);
+                }
+            }
+            // A concurrent full capture ("capture_in_progress") or a broker
+            // hiccup only costs this sample.
+            Err(error) => {
+                tracing::debug!(log_module = "Locus", "Unity stall sample skipped: {error}")
+            }
+        }
+        taken = taken.saturating_add(1);
+        let wait = Duration::from_millis(timeline::next_interval_ms(taken));
+        let started = std::time::Instant::now();
+        while started.elapsed() < wait {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if !timeline_is_current(&project_path, epoch) {
+                return;
+            }
+        }
+    }
+}
+
+async fn capture_timeline_sample(
+    project_path: &str,
+    pid: u32,
+) -> Result<timeline::TimelineSample, String> {
+    let response = super::transport::send_message_with_timeout(
+        project_path,
+        "main_thread_stack",
+        TIMELINE_CAPTURE_REQUEST,
+        BROKER_CAPTURE_TIMEOUT,
+    )
+    .await?;
+    if !response.ok {
+        return Err(response
+            .error
+            .unwrap_or_else(|| "main_thread_stack returned ok=false".to_string()));
+    }
+    let capture: BrokerCapture = serde_json::from_str(response.message.as_deref().unwrap_or(""))
+        .map_err(|error| format!("invalid main_thread_stack payload: {error}"))?;
+    if capture.process_id != 0 && capture.process_id != pid {
+        return Err(format!("stack was captured from Unity pid {}", capture.process_id));
+    }
+    timeline_sample_from_capture(project_path, &capture)
+}
+
+fn timeline_sample_from_capture(
+    project_path: &str,
+    capture: &BrokerCapture,
+) -> Result<timeline::TimelineSample, String> {
+    let sample = capture
+        .samples
+        .iter()
+        .find(|sample| !sample.frames.is_empty())
+        .ok_or_else(|| "the main-thread stack was empty".to_string())?;
+    let names: HashMap<u64, &ManagedName> =
+        capture.managed.iter().map(|name| (name.ip, name)).collect();
+    let frames = sample
+        .frames
+        .iter()
+        .map(|frame| match names.get(&frame.ip) {
+            Some(name) => timeline::TimelineFrame {
+                ip: frame.ip,
+                sp: frame.sp,
+                method: Some(name.method.clone()),
+                origin: managed_origin(&name.method, name.assembly.as_deref()),
+                display: match (name.file.as_deref(), name.line) {
+                    (Some(file), Some(line)) => format!(
+                        "{} (at {}:{line})",
+                        name.method,
+                        relative_source_path(project_path, file)
+                    ),
+                    _ => name.method.clone(),
+                },
+            },
+            None => timeline::TimelineFrame {
+                ip: frame.ip,
+                sp: frame.sp,
+                method: None,
+                origin: "native",
+                display: format!("0x{:016X}", frame.ip),
+            },
+        })
+        .collect();
+    let at_ms = u64::try_from(capture.started_at_ms)
+        .ok()
+        .filter(|ms| *ms > 0)
+        .unwrap_or_else(unix_now_ms);
+    Ok(timeline::TimelineSample {
+        at_ms,
+        cpu_100ns: capture.cpu_end_100ns.or(capture.cpu_start_100ns),
+        frames,
+        names_ok: matches!(capture.managed_status.as_str(), "ok" | "skipped"),
+        suspend_us: sample.suspend_us,
+    })
 }
 
 async fn run_incident(project_path: String, generation: u64, target: CaptureTarget) {
@@ -437,6 +626,7 @@ pub(crate) fn is_user_restart_interrupt(error: &str) -> bool {
 struct BrokerCapture {
     thread_id: u32,
     process_id: u32,
+    started_at_ms: i64,
     wall_ms: u64,
     cpu_start_100ns: Option<u64>,
     cpu_end_100ns: Option<u64>,
@@ -450,6 +640,7 @@ struct BrokerCapture {
 #[serde(rename_all = "camelCase", default)]
 struct BrokerSample {
     frames: Vec<BrokerFrame>,
+    suspend_us: u64,
     unwind_stop: Option<String>,
     error: Option<String>,
 }
@@ -458,6 +649,7 @@ struct BrokerSample {
 #[serde(rename_all = "camelCase", default)]
 struct BrokerFrame {
     ip: u64,
+    sp: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1184,6 +1376,7 @@ fn build_diagnosis(
         frames,
         notes,
         error: None,
+        stall: None,
     }
 }
 
@@ -1199,6 +1392,13 @@ pub(crate) fn format_for_agent(diagnosis: &UnityHangDiagnosis) -> String {
         diagnosis.process_id
     ));
     lines.push(format!("- Verdict: {}", diagnosis.summary));
+    if let Some(stall) = &diagnosis.stall {
+        lines.push(format!(
+            "- Over time ({} samples): {}",
+            stall.samples,
+            timeline::describe(stall)
+        ));
+    }
     if let Some(location) = &diagnosis.location {
         let owner = match location.origin.as_str() {
             "agent" => " — code executed by the agent (unity_execute / run_states snippet)",
@@ -1269,6 +1469,7 @@ mod tests {
             created: Some(7),
             thread_id: Some(9),
             broker_stack: true,
+            name_cache: true,
             heartbeat_age_ms: Some(31_000),
             active_executions: Some(0),
             editor_dir: None,
@@ -1282,6 +1483,67 @@ mod tests {
             displacement: 0x10,
             module_offset: 0x1000,
         }
+    }
+
+    #[test]
+    fn timeline_sample_keeps_stack_pointers_names_and_suspend_cost() {
+        let payload = r#"{
+            "version": 1, "threadId": 9, "processId": 42, "startedAtMs": 1700000000000,
+            "wallMs": 0, "cpuStart100ns": 50000000, "cpuEnd100ns": 50000100,
+            "samples": [{"capturedAtMs": 1700000000000, "suspendUs": 140, "stackBytes": 4096,
+                         "frames": [{"ip": 16, "sp": 4096}, {"ip": 32, "sp": 4200}, {"ip": 48, "sp": 4300}]}],
+            "managed": [
+                {"ip": 32, "method": "Game.Boot:Init ()", "assembly": "Assembly-CSharp",
+                 "file": "F:/Proj/Assets/Boot.cs", "line": 12, "nativeOffset": 4},
+                {"ip": 48, "method": "__LocusSnippet:ExecuteSync ()", "assembly": "__LocusRaw_1", "nativeOffset": 8}
+            ],
+            "managedStatus": "ok"
+        }"#;
+        let capture: BrokerCapture = serde_json::from_str(payload).unwrap();
+        let sample = timeline_sample_from_capture("F:/Proj", &capture).unwrap();
+        assert_eq!(sample.at_ms, 1_700_000_000_000);
+        assert_eq!(sample.cpu_100ns, Some(50_000_100));
+        assert_eq!(sample.suspend_us, 140);
+        assert!(sample.names_ok);
+        assert_eq!(sample.frames.len(), 3);
+        assert_eq!(sample.frames[0].origin, "native");
+        assert_eq!(sample.frames[1].sp, 4200);
+        assert_eq!(sample.frames[1].origin, "user");
+        assert_eq!(sample.frames[1].display, "Game.Boot:Init () (at Assets/Boot.cs:12)");
+        assert_eq!(sample.frames[2].origin, "agent");
+
+        let timed_out: BrokerCapture = serde_json::from_str(
+            &payload.replace(r#""managedStatus": "ok""#, r#""managedStatus": "timeout""#),
+        )
+        .unwrap();
+        assert!(!timeline_sample_from_capture("F:/Proj", &timed_out).unwrap().names_ok);
+    }
+
+    #[test]
+    fn agent_report_includes_the_timeline_assessment() {
+        let raw = RawCapture {
+            source: "native_broker",
+            samples: vec![vec![0x10]],
+            cpu_percent: Some(99.0),
+            managed: HashMap::new(),
+            unwind_stop: None,
+            notes: Vec::new(),
+        };
+        let mut diagnosis = build_diagnosis("F:/Proj", &target(), 1, raw, &HashMap::new(), Vec::new());
+        diagnosis.stall = Some(UnityStallAssessment {
+            kind: "suspected_infinite_loop".to_string(),
+            owner: "user".to_string(),
+            for_ms: 125_000,
+            samples: 26,
+            cpu_percent: Some(98.0),
+            frame: Some("Game.Hash:Run () (at Assets/Hash.cs:9)".to_string()),
+            blocks_progress: true,
+            max_suspend_us: Some(210),
+        });
+        let text = format_for_agent(&diagnosis);
+        assert!(text.contains("Over time (26 samples)"), "{text}");
+        assert!(text.contains("running for 125s without returning"), "{text}");
+        assert!(text.contains("Game.Hash:Run ()"), "{text}");
     }
 
     #[test]
@@ -1513,6 +1775,7 @@ mod tests {
             created: super::super::process::process_created_at_unix_ms(pid),
             thread_id: None,
             broker_stack: !external,
+            name_cache: false,
             heartbeat_age_ms: None,
             active_executions: None,
             editor_dir,

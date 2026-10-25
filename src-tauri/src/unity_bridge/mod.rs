@@ -5740,7 +5740,7 @@ where
                         Ok(None) => {}
                         Err(error) => {
                             if error.contains("native_main_thread_unresponsive") {
-                                break Err(format!("native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; execution has not been confirmed stopped"));
+                                break Err(format!("native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; execution has not been confirmed stopped. If this snippet should not finish, stop it with `await locus.cancel_unity_execution(project=..., execution_id=\"{execution_id}\")` (loops in unity_execute code stop at their next iteration); otherwise read its result later with `locus.wait_unity_execution`."));
                             }
                             last_progress_poll_error = Some(error);
                             if saw_unity_progress {
@@ -6196,7 +6196,7 @@ where
                         Ok(None) => {}
                         Err(error) => {
                             if error.contains("native_main_thread_unresponsive") {
-                                break Err(format!("native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; execution has not been confirmed stopped"));
+                                break Err(format!("native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; execution has not been confirmed stopped. If this snippet should not finish, stop it with `await locus.cancel_unity_execution(project=..., execution_id=\"{execution_id}\")` (loops in unity_execute code stop at their next iteration); otherwise read its result later with `locus.wait_unity_execution`."));
                             }
                             last_progress_poll_error = Some(error);
                             if saw_unity_progress {
@@ -6503,6 +6503,22 @@ const RECOMPILE_START_STATE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 const RECOMPILE_START_STATE_HISTORY_LIMIT: usize = 6;
 const RECOMPILE_POLL_TIMEOUT: Duration = Duration::from_secs(4);
 const RECOMPILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Continuous main-thread unresponsiveness one recompile tolerates. Compiles,
+/// imports and post-reload initializers legitimately hold the main thread for
+/// tens of seconds; only a stall past this budget (or one the hang timeline
+/// says cannot recover) ends the wait.
+const RECOMPILE_UNRESPONSIVE_BUDGET: Duration = Duration::from_secs(180);
+const RECOMPILE_BUSY_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+const RECOMPILE_BUSY_PERIODIC_CHECK: Duration = Duration::from_secs(5);
+const RECOMPILE_OPERATION_MISMATCH_LIMIT: u32 = 20;
+/// After a "not needed" verdict, how long to wait for Unity to finish any
+/// compile or import that follows it, and how many consecutive idle reads
+/// (500ms apart) count as settled.
+const RECOMPILE_SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+const RECOMPILE_SETTLE_IDLE_READS: u32 = 2;
+/// Broker rejection for requests that arrive while the editor loop has not
+/// pumped for 30s. Such a request was never queued for Unity.
+const MAIN_THREAD_UNRESPONSIVE_ERROR: &str = "native_main_thread_unresponsive";
 
 #[derive(Debug)]
 struct RecompileStateSample {
@@ -6661,6 +6677,13 @@ enum RecompileStartAck {
     Started,
     Unconfirmed,
     ReloadBoundary,
+    /// The broker refused the request because the main thread had not pumped
+    /// the editor loop for 30s. It never reached Unity, so resending after the
+    /// loop returns cannot start a second compile.
+    EditorBusyNotSent,
+    /// Another recompile owns the editor. Wait for it, then request ours: its
+    /// compile may predate the sources this caller needs.
+    InProgress { operation_id: Option<String> },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -6669,6 +6692,30 @@ enum RecompilePollState {
     Completed,
     NotNeeded,
     Transient,
+    /// The broker could not queue the read (old plugin, main thread away).
+    EditorBusy,
+    /// Unity's register belongs to another operation.
+    OperationMismatch,
+}
+
+fn is_main_thread_unresponsive_error(error: &str) -> bool {
+    error.trim() == MAIN_THREAD_UNRESPONSIVE_ERROR
+}
+
+/// `Some(operation)` when Unity refused because another recompile is active.
+/// Current plugins name the active operation; older ones only say so in text.
+fn recompile_in_progress_operation(error: &str) -> Option<Option<String>> {
+    let error = error.trim();
+    if let Some(rest) = error.strip_prefix("recompile_in_progress") {
+        let operation = rest
+            .split(';')
+            .filter_map(|part| part.trim().strip_prefix("operation_id="))
+            .map(str::trim)
+            .find(|id| !id.is_empty())
+            .map(str::to_string);
+        return Some(operation);
+    }
+    error.contains("重编译请求正在进行中").then_some(None)
 }
 
 fn classify_recompile_start_response(resp: &PipeResponse) -> Result<RecompileStartAck, String> {
@@ -6688,6 +6735,10 @@ fn classify_recompile_start_response(resp: &PipeResponse) -> Result<RecompileSta
         .unwrap_or_else(|| "Unity 没有开始编译。启动确认失败。".to_string());
     if is_reload_boundary_broker_error(&error) {
         Ok(RecompileStartAck::ReloadBoundary)
+    } else if is_main_thread_unresponsive_error(&error) {
+        Ok(RecompileStartAck::EditorBusyNotSent)
+    } else if let Some(operation_id) = recompile_in_progress_operation(&error) {
+        Ok(RecompileStartAck::InProgress { operation_id })
     } else {
         Err(error)
     }
@@ -6730,7 +6781,14 @@ async fn request_recompile_and_wait_for_start(
             biased;
             result = &mut request => {
                 let classified = match result {
-                    Ok(resp) => classify_recompile_start_response(&resp),
+                    Ok(resp) => classify_recompile_start_response(&resp).inspect(|ack| {
+                        if *ack == RecompileStartAck::Started {
+                            eprintln!(
+                                "[Locus] request_recompile started after {}ms",
+                                started_at.elapsed().as_millis()
+                            );
+                        }
+                    }),
                     Err(error) if is_reload_boundary_broker_error(&error) => {
                         Ok(RecompileStartAck::ReloadBoundary)
                     }
@@ -6803,7 +6861,11 @@ fn classify_recompile_poll_response(resp: &PipeResponse) -> Result<RecompilePoll
         .error
         .clone()
         .unwrap_or_else(|| "Compilation failed (unknown error)".to_string());
-    if is_transient_broker_error(&error) || error.trim() == "recompile_result_operation_mismatch" {
+    if is_main_thread_unresponsive_error(&error) {
+        Ok(RecompilePollState::EditorBusy)
+    } else if error.trim() == "recompile_result_operation_mismatch" {
+        Ok(RecompilePollState::OperationMismatch)
+    } else if is_transient_broker_error(&error) {
         Ok(RecompilePollState::Transient)
     } else {
         Err(error)
@@ -6828,13 +6890,23 @@ async fn finish_recompile_success(
         project_path,
         unity_test_pending_seq,
     );
+    // The rebuilt assemblies are loaded, so this snapshot's changes are in
+    // Unity. Acknowledge before waiting on the bridge: a busy editor must not
+    // leave them pending, which would force a full refresh on every later
+    // recompile.
+    crate::workspace_changes::acknowledge_unity_sync(Path::new(project_path), asset_sync);
     if let Err(error) = wait_for_unity_bridge_ready_after_recompile(project_path).await {
         let state = unity_semantic_state(project_path).await;
-        return Err(format!(
-            "Unity recompile status:\n- status: compiled_bridge_recovering\n- compilation: completed\n- detection: rebuilt_assembly_output\n- domain_reload: completed\n- bridge: not_ready\n- editor: {}\n- phase: {}\n- action: {}\n- detail: {}",
+        eprintln!(
+            "[Locus] Unity recompile completed but the editor is still busy after the reload: {}",
+            format_recompile_state_detail(&state)
+        );
+        return Ok(format!(
+            "Unity recompile status:\n- status: compiled\n- compilation: completed\n- detection: rebuilt_assembly_output\n- asset_sync: {}\n- asset_sync_reason: {}\n- domain_reload: completed\n- bridge: recovering\n- editor: {}\n- phase: {}\n- action: wait_for_editor\n- detail: The rebuilt assemblies are loaded. Unity's main thread is still busy after the reload (initializers, imports or repaint), so the next Unity API call may wait. {}",
+            asset_sync.mode.as_str(),
+            asset_sync.reason,
             state.editor_mode.value,
             state.phase,
-            state.safety.recommended_action,
             error.replace(['\r', '\n'], " ")
         ));
     }
@@ -6844,7 +6916,6 @@ async fn finish_recompile_success(
             error
         );
     }
-    crate::workspace_changes::acknowledge_unity_sync(Path::new(project_path), asset_sync);
     let state = unity_semantic_state(project_path).await;
     Ok(format!(
         "Unity recompile status:\n- status: compiled\n- compilation: completed\n- detection: rebuilt_assembly_output\n- asset_sync: {}\n- asset_sync_reason: {}\n- domain_reload: completed\n- bridge: ready\n- editor: {}\n- phase: {}\n- action: {}",
@@ -7046,60 +7117,236 @@ async fn finish_recompile_not_needed(
     ))
 }
 
-async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> {
-    let existing_reload = wait_for_existing_reload(project_path).await?;
-    let operation_id = format!("recompile-{}", uuid::Uuid::new_v4().simple());
+#[derive(Debug, PartialEq, Eq)]
+enum EditorBusyVerdict {
+    /// The editor loop is pumping.
+    Responsive,
+    /// Away, but within budget and not known to be stuck.
+    KeepWaiting,
+    /// Away past the budget, or the hang timeline says it cannot recover.
+    GiveUp,
+}
 
-    // Hot-reload edits bypass the AssetDatabase entirely; forward every
-    // tracked dirty path so the plugin imports created files (and refreshes
-    // away deleted ones) before compiling. Without this, files created or
-    // deleted during a hot-reload session would be missing from (or stale
-    // in) the converged assembly. Older plugins ignore the message body.
-    let (unity_test_pending_seq, unity_test_pending_paths) =
-        crate::workspace::unity_test_pending_source_snapshot(project_path);
-    let mut tracked_dirty_sources =
-        crate::unity_hotreload::coordinator::pending_paths(project_path).await;
-    tracked_dirty_sources.extend(unity_test_pending_paths);
-    tracked_dirty_sources.sort();
-    tracked_dirty_sources.dedup();
-    let tracked_dirty_paths = relative_asset_paths(project_path, &tracked_dirty_sources);
-    let asset_sync = crate::workspace_changes::snapshot_unity_sync(
-        Path::new(project_path),
-        &tracked_dirty_paths,
-    );
-    eprintln!(
-        "[Locus] Unity asset sync decision: mode={}, paths={}, generation={}, through_seq={}, health={:?}, reason={}",
-        asset_sync.mode.as_str(),
-        asset_sync.paths.len(),
-        asset_sync.generation,
-        asset_sync.through_seq,
-        asset_sync.health,
-        asset_sync.reason,
-    );
+fn editor_busy_verdict(unresponsive: bool, blocks_progress: bool, away_for: Duration) -> EditorBusyVerdict {
+    if !unresponsive {
+        EditorBusyVerdict::Responsive
+    } else if blocks_progress || away_for >= RECOMPILE_UNRESPONSIVE_BUDGET {
+        EditorBusyVerdict::GiveUp
+    } else {
+        EditorBusyVerdict::KeepWaiting
+    }
+}
 
-    let mut disconnected = match request_recompile_and_wait_for_start(
-        project_path,
-        &asset_sync,
-        &operation_id,
-    )
-    .await?
-    {
-        RecompileStartAck::Started => false,
-        RecompileStartAck::Unconfirmed => {
-            eprintln!(
-                "[Locus] compilation start acknowledgement was not observed; reconciling persisted compile state"
-            );
-            false
+fn semantic_state_main_thread_unresponsive(state: &SemanticState) -> bool {
+    state.phase == "unresponsive" || state.main_thread.state.starts_with("unresponsive")
+}
+
+/// Tracks how long Unity's main thread has stayed away from the editor loop
+/// during one recompile. Reads only the observer's cached semantic state.
+struct EditorBusyTracker {
+    away_since: Option<Instant>,
+    last_check: Option<Instant>,
+}
+
+impl EditorBusyTracker {
+    fn new() -> Self {
+        Self {
+            away_since: None,
+            last_check: None,
         }
-        RecompileStartAck::ReloadBoundary => {
-            transport::disconnect(project_path).await;
-            eprintln!(
-                "[Locus] request_recompile crossed a domain reload before the start acknowledgement; waiting for persisted state"
-            );
-            true
-        }
-    };
+    }
 
+    /// `Ok(true)` while the main thread is away but waiting is reasonable,
+    /// `Ok(false)` when it is pumping, a structured error when waiting stops
+    /// being reasonable.
+    async fn check(&mut self, project_path: &str) -> Result<bool, String> {
+        let state = Box::pin(unity_semantic_state(project_path)).await;
+        self.last_check = Some(Instant::now());
+        let unresponsive = semantic_state_main_thread_unresponsive(&state);
+        if !unresponsive {
+            self.away_since = None;
+            return Ok(false);
+        }
+        let away_for = self.away_since.get_or_insert_with(Instant::now).elapsed();
+        let blocks_progress = state
+            .hang_diagnosis
+            .as_ref()
+            .and_then(|diagnosis| diagnosis.stall.as_ref())
+            .is_some_and(|stall| stall.blocks_progress);
+        match editor_busy_verdict(true, blocks_progress, away_for) {
+            EditorBusyVerdict::GiveUp => Err(Box::pin(editor_unresponsive_recompile_error(
+                project_path,
+                &state,
+                away_for,
+            ))
+            .await),
+            _ => Ok(true),
+        }
+    }
+
+    async fn check_periodically(&mut self, project_path: &str) -> Result<(), String> {
+        if self
+            .last_check
+            .is_some_and(|at| at.elapsed() < RECOMPILE_BUSY_PERIODIC_CHECK)
+        {
+            return Ok(());
+        }
+        Box::pin(self.check(project_path)).await.map(|_| ())
+    }
+}
+
+async fn editor_unresponsive_recompile_error(
+    project_path: &str,
+    state: &SemanticState,
+    away_for: Duration,
+) -> String {
+    let stall = state
+        .hang_diagnosis
+        .as_ref()
+        .and_then(|diagnosis| diagnosis.stall.as_ref());
+    let blocks_progress = stall.is_some_and(|stall| stall.blocks_progress);
+    let away_secs = state
+        .main_thread
+        .heartbeat_age_ms
+        .map(|age| age / 1_000)
+        .unwrap_or(0)
+        .max(away_for.as_secs());
+    let header = format!(
+        "Unity recompile status:\n- status: editor_unresponsive\n- compilation: unconfirmed\n- domain_reload: unconfirmed\n- bridge: main_thread_unresponsive\n- stall: {}\n- action: {}\n- detail: Unity's main thread has not returned to the editor loop for {away_secs}s{}. The compile was not confirmed; check the stall location below before retrying.",
+        stall.map(|stall| stall.kind.as_str()).unwrap_or("unknown"),
+        if blocks_progress { "fix_blocking_code_then_restart_editor" } else { "diagnose_hang" },
+        if blocks_progress { " and the hang timeline shows it will not recover by itself" } else { "" },
+    );
+    hang_diagnosis::append_to_unresponsive_error(project_path, header).await
+}
+
+/// After a `native_main_thread_unresponsive` rejection: wait until the editor
+/// loop pumps again (or waiting stops being reasonable).
+async fn wait_for_editor_loop(project_path: &str, busy: &mut EditorBusyTracker) -> Result<(), String> {
+    loop {
+        if let Some(error) = dialog::blocked_error(project_path, "not_sent", None) {
+            return Err(error);
+        }
+        tokio::time::sleep(RECOMPILE_BUSY_RECHECK_INTERVAL).await;
+        if !busy.check(project_path).await? {
+            return Ok(());
+        }
+    }
+}
+
+/// Domain identity + convergence serial, read before a recompile request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReloadBaseline {
+    session_id: String,
+    converged_serial: i64,
+}
+
+async fn fetch_reload_baseline(project_path: &str) -> Option<ReloadBaseline> {
+    fetch_reload_state(project_path)
+        .await
+        .map(|(session_id, _, converged_serial)| ReloadBaseline {
+            session_id,
+            converged_serial,
+        })
+}
+
+/// A compile that ran after the request rebuilt and loaded assemblies: the
+/// serial only advances once new assemblies are loaded (or the editor
+/// process changed, which also loaded the current sources).
+fn follow_up_compile_converged(baseline: Option<&ReloadBaseline>, settled: &ReloadStateMessage) -> bool {
+    match baseline {
+        Some(baseline) if baseline.session_id == settled.session_id => {
+            settled.converged_serial > baseline.converged_serial
+        }
+        Some(_) => !settled.session_id.is_empty(),
+        None => false,
+    }
+}
+
+/// Wait until Unity is neither compiling nor importing, after a "not needed"
+/// verdict. Unity can finish the requested (no-op) compile and immediately
+/// run another one for imports that landed meanwhile; returning before that
+/// lets the caller's next Unity call hit the follow-up domain reload. Returns
+/// the settled reload state, or `None` when it could not be read (older
+/// plugin or the settle window ran out).
+async fn settle_after_not_needed(
+    project_path: &str,
+    busy: &mut EditorBusyTracker,
+) -> Result<Option<ReloadStateMessage>, String> {
+    let started = Instant::now();
+    let mut idle_reads = 0u32;
+    loop {
+        if let Some(error) = dialog::blocked_error(project_path, "unknown", None) {
+            return Err(error);
+        }
+        if started.elapsed() >= RECOMPILE_SETTLE_TIMEOUT {
+            eprintln!(
+                "[Locus] Unity kept compiling or importing for {}s after a no-op recompile; reporting the verdict as is",
+                RECOMPILE_SETTLE_TIMEOUT.as_secs()
+            );
+            return Ok(None);
+        }
+        match send_message_with_timeout(project_path, "get_reload_state", "", RECOMPILE_POLL_TIMEOUT)
+            .await
+        {
+            Ok(resp) if resp.ok => {
+                let parsed = resp
+                    .message
+                    .as_deref()
+                    .and_then(|message| serde_json::from_str::<ReloadStateMessage>(message).ok());
+                let Some(parsed) = parsed else {
+                    return Ok(None);
+                };
+                if parsed.is_compiling || parsed.is_updating {
+                    idle_reads = 0;
+                } else {
+                    idle_reads += 1;
+                    if idle_reads >= RECOMPILE_SETTLE_IDLE_READS {
+                        return Ok(Some(parsed));
+                    }
+                }
+            }
+            Ok(resp) => {
+                idle_reads = 0;
+                let error = resp.error.unwrap_or_default();
+                if is_main_thread_unresponsive_error(&error) {
+                    busy.check(project_path).await?;
+                } else if !is_transient_broker_error(&error) {
+                    // A plugin without the message: keep its old behavior.
+                    return Ok(None);
+                }
+            }
+            Err(error) => {
+                idle_reads = 0;
+                if !is_recompile_poll_response_timeout(&error) {
+                    transport::disconnect(project_path).await;
+                }
+                busy.check_periodically(project_path).await?;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecompileOutcome {
+    Completed,
+    NotNeeded,
+    /// Unity's terminal error for the operation (compile errors included).
+    Failed(String),
+}
+
+/// Poll Unity's persisted register for `operation_id` until it is terminal.
+/// `adopting` waits on another caller's operation and stops as soon as the
+/// register moves to a different one.
+async fn poll_recompile_outcome(
+    project_path: &str,
+    operation_id: &str,
+    mut disconnected: bool,
+    busy: &mut EditorBusyTracker,
+    adopting: bool,
+) -> Result<RecompileOutcome, String> {
+    let mut mismatches = 0u32;
     loop {
         if let Some(error) = dialog::blocked_error(project_path, "unknown", None) {
             return Err(error);
@@ -7112,7 +7359,10 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
                     eprintln!("[Locus] Unity reconnected after domain reload");
                     disconnected = false;
                 }
-                _ => continue,
+                _ => {
+                    busy.check_periodically(project_path).await?;
+                    continue;
+                }
             }
         }
 
@@ -7120,30 +7370,39 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
         match send_message_with_timeout(
             project_path,
             "get_compile_result",
-            &operation_id,
+            operation_id,
             RECOMPILE_POLL_TIMEOUT,
         )
         .await
         {
-            Ok(resp) => match classify_recompile_poll_response(&resp)? {
-                RecompilePollState::Waiting | RecompilePollState::Transient => continue,
-                RecompilePollState::Completed => {
-                    return finish_recompile_success(
-                        project_path,
-                        unity_test_pending_seq,
-                        &asset_sync,
-                    )
-                    .await
+            Ok(resp) => match classify_recompile_poll_response(&resp) {
+                Ok(RecompilePollState::Waiting | RecompilePollState::Transient) => {
+                    mismatches = 0;
+                    // Current brokers answer from their register even while
+                    // the main thread is away, so watch for a stuck editor here.
+                    busy.check_periodically(project_path).await?;
                 }
-                RecompilePollState::NotNeeded => {
-                    return finish_recompile_not_needed(
-                        project_path,
-                        &existing_reload,
-                        unity_test_pending_seq,
-                        &asset_sync,
-                    )
-                    .await
+                Ok(RecompilePollState::EditorBusy) => {
+                    if busy.check(project_path).await? {
+                        tokio::time::sleep(RECOMPILE_BUSY_RECHECK_INTERVAL).await;
+                    }
                 }
+                Ok(RecompilePollState::OperationMismatch) => {
+                    if adopting {
+                        return Ok(RecompileOutcome::Failed(
+                            "the adopted recompile was replaced by another request".to_string(),
+                        ));
+                    }
+                    mismatches += 1;
+                    if mismatches >= RECOMPILE_OPERATION_MISMATCH_LIMIT {
+                        return Err(format!(
+                            "Unity recompile status:\n- status: superseded\n- compilation: unconfirmed\n- domain_reload: unconfirmed\n- action: retry_recompile\n- detail: Unity's compile register belongs to another request; operation {operation_id} was replaced before it reported a result."
+                        ));
+                    }
+                }
+                Ok(RecompilePollState::Completed) => return Ok(RecompileOutcome::Completed),
+                Ok(RecompilePollState::NotNeeded) => return Ok(RecompileOutcome::NotNeeded),
+                Err(error) => return Ok(RecompileOutcome::Failed(error)),
             },
             Err(error) => {
                 if is_recompile_poll_response_timeout(&error) {
@@ -7154,6 +7413,7 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
                     eprintln!(
                         "[Locus] Unity compile-result response timed out; keeping the native bridge and retrying the persisted result"
                     );
+                    busy.check_periodically(project_path).await?;
                     continue;
                 }
                 disconnected = true;
@@ -7166,12 +7426,140 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
     }
 }
 
+async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> {
+    let existing_reload = Box::pin(wait_for_existing_reload(project_path)).await?;
+    let mut busy = EditorBusyTracker::new();
+    let mut adopted_operation = false;
+
+    let (operation_id, asset_sync, unity_test_pending_seq, disconnected, reload_baseline) = loop {
+        let operation_id = format!("recompile-{}", uuid::Uuid::new_v4().simple());
+        // Before the request, so a compile that converges after a no-op
+        // verdict can be recognized (see settle_after_not_needed).
+        let reload_baseline = Box::pin(fetch_reload_baseline(project_path)).await;
+
+        // Hot-reload edits bypass the AssetDatabase entirely; forward every
+        // tracked dirty path so the plugin imports created files (and refreshes
+        // away deleted ones) before compiling. Without this, files created or
+        // deleted during a hot-reload session would be missing from (or stale
+        // in) the converged assembly. Older plugins ignore the message body.
+        // Taken per attempt: a resend after waiting must cover newer edits.
+        let (unity_test_pending_seq, unity_test_pending_paths) =
+            crate::workspace::unity_test_pending_source_snapshot(project_path);
+        let mut tracked_dirty_sources =
+            crate::unity_hotreload::coordinator::pending_paths(project_path).await;
+        tracked_dirty_sources.extend(unity_test_pending_paths);
+        tracked_dirty_sources.sort();
+        tracked_dirty_sources.dedup();
+        let tracked_dirty_paths = relative_asset_paths(project_path, &tracked_dirty_sources);
+        let asset_sync = crate::workspace_changes::snapshot_unity_sync(
+            Path::new(project_path),
+            &tracked_dirty_paths,
+        );
+        eprintln!(
+            "[Locus] Unity asset sync decision: mode={}, paths={}, generation={}, through_seq={}, health={:?}, reason={}",
+            asset_sync.mode.as_str(),
+            asset_sync.paths.len(),
+            asset_sync.generation,
+            asset_sync.through_seq,
+            asset_sync.health,
+            asset_sync.reason,
+        );
+
+        match Box::pin(request_recompile_and_wait_for_start(project_path, &asset_sync, &operation_id)).await? {
+            RecompileStartAck::Started => {
+                break (operation_id, asset_sync, unity_test_pending_seq, false, reload_baseline)
+            }
+            RecompileStartAck::Unconfirmed => {
+                eprintln!(
+                    "[Locus] compilation start acknowledgement was not observed; reconciling persisted compile state"
+                );
+                break (operation_id, asset_sync, unity_test_pending_seq, false, reload_baseline);
+            }
+            RecompileStartAck::ReloadBoundary => {
+                transport::disconnect(project_path).await;
+                eprintln!(
+                    "[Locus] request_recompile crossed a domain reload before the start acknowledgement; waiting for persisted state"
+                );
+                break (operation_id, asset_sync, unity_test_pending_seq, true, reload_baseline);
+            }
+            RecompileStartAck::EditorBusyNotSent => {
+                eprintln!(
+                    "[Locus] request_recompile was not delivered: Unity's main thread is away from the editor loop; resending once it pumps again"
+                );
+                Box::pin(wait_for_editor_loop(project_path, &mut busy)).await?;
+            }
+            RecompileStartAck::InProgress { operation_id: active } => {
+                if adopted_operation {
+                    return Err(
+                        "Unity recompile status:\n- status: recompile_in_progress\n- compilation: not_requested\n- domain_reload: unconfirmed\n- action: retry_recompile\n- detail: Unity still reports another recompile in progress after this request waited for it."
+                            .to_string(),
+                    );
+                }
+                adopted_operation = true;
+                eprintln!(
+                    "[Locus] another recompile ({}) is in progress; waiting for it before requesting this one",
+                    active.as_deref().unwrap_or("operation id not reported")
+                );
+                // The outcome belongs to the other request. This request still
+                // compiles afterwards so the current sources are what loads.
+                let outcome = Box::pin(poll_recompile_outcome(
+                    project_path,
+                    active.as_deref().unwrap_or(""),
+                    false,
+                    &mut busy,
+                    true,
+                ))
+                .await?;
+                eprintln!("[Locus] adopted recompile finished: {outcome:?}");
+            }
+        }
+    };
+
+    match Box::pin(poll_recompile_outcome(project_path, &operation_id, disconnected, &mut busy, false)).await? {
+        RecompileOutcome::Completed => {
+            Box::pin(finish_recompile_success(project_path, unity_test_pending_seq, &asset_sync)).await
+        }
+        RecompileOutcome::NotNeeded => {
+            let settled = Box::pin(settle_after_not_needed(project_path, &mut busy)).await?;
+            if settled
+                .as_ref()
+                .is_some_and(|settled| follow_up_compile_converged(reload_baseline.as_ref(), settled))
+            {
+                eprintln!(
+                    "[Locus] the requested compile was a no-op, but a follow-up compile rebuilt and loaded assemblies; reporting it as compiled"
+                );
+                return Box::pin(finish_recompile_success(
+                    project_path,
+                    unity_test_pending_seq,
+                    &asset_sync,
+                ))
+                .await;
+            }
+            Box::pin(finish_recompile_not_needed(
+                project_path,
+                &existing_reload,
+                unity_test_pending_seq,
+                &asset_sync,
+            ))
+            .await
+        }
+        RecompileOutcome::Failed(error) => Err(error),
+    }
+}
+
 /// Trigger a Unity recompile and wait until the requested compilation starts,
 /// finishes, and loads into a new AppDomain. `request_recompile` acknowledges
 /// only from Unity's `CompilationPipeline.compilationStarted` event. A pipe
 /// reconnect is connectivity evidence only; completion still requires the
 /// persisted `get_compile_result == ok` state from the reloaded domain.
 pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
+    // Callers (tools, CLI acceptance suites awaiting several recompiles in one
+    // future) keep only this pointer; the full state machine is large in
+    // debug builds and overflowed the tokio worker stack when inlined.
+    Box::pin(recompile_and_wait_boxed(project_path)).await
+}
+
+async fn recompile_and_wait_boxed(project_path: &str) -> Result<String, String> {
     // Recompile releases all Editor edit owners. Consume deferred starts first
     // so later source-edit rounds can establish a fresh suppression session.
     wait_for_edit_session_starts(project_path, "").await;
@@ -7193,7 +7581,7 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
 
     let result = match tokio::time::timeout(
         RECOMPILE_TOTAL_TIMEOUT,
-        recompile_and_wait_inner(project_path),
+        Box::pin(recompile_and_wait_inner(project_path)),
     )
     .await
     {
@@ -7205,9 +7593,30 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
                 RECOMPILE_TOTAL_TIMEOUT.as_secs(),
                 format_recompile_state_detail(&state)
             );
-            Err(recompile_timeout_reason(&state))
+            let error = format!(
+                "Unity recompile status:\n- status: timed_out\n- compilation: unconfirmed\n- domain_reload: unconfirmed\n- editor: {}\n- phase: {}\n- action: {}\n- detail: {}",
+                state.editor_mode.value,
+                state.phase,
+                state.safety.recommended_action,
+                recompile_timeout_reason(&state)
+            );
+            if semantic_state_main_thread_unresponsive(&state) {
+                Err(hang_diagnosis::append_to_unresponsive_error(project_path, error).await)
+            } else {
+                Err(error)
+            }
         }
     };
+    if let Err(error) = &result {
+        // Every terminal failure leaves one line with the editor state, so a
+        // misreported recompile can be reconstructed from the log afterwards.
+        let state = state_probe::semantic_state_for_project(project_path).await;
+        eprintln!(
+            "[Locus] unity_recompile failed: {} || state: {}",
+            error.lines().take(10).collect::<Vec<_>>().join(" | "),
+            format_recompile_state_detail(&state)
+        );
+    }
 
     if let Some(hwnd) = prev_foreground {
         focus::restore_foreground(hwnd);
@@ -7356,6 +7765,12 @@ struct ReloadStateMessage {
     domain_generation: String,
     #[serde(default)]
     converged_serial: i64,
+    /// `EditorApplication.isCompiling` / `isUpdating` at the read. Older
+    /// plugins omit them, which reads as settled (their previous behavior).
+    #[serde(default)]
+    is_compiling: bool,
+    #[serde(default)]
+    is_updating: bool,
 }
 
 /// Read Unity's reload lifecycle — the per-process session id, per-domain
@@ -7676,8 +8091,11 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
 mod tests {
     use super::{
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
-        classify_recompile_poll_response, classify_recompile_start_response,
+        classify_recompile_poll_response, classify_recompile_start_response, editor_busy_verdict,
         is_recompile_poll_response_timeout, is_transient_broker_error,
+        recompile_in_progress_operation, EditorBusyVerdict, RECOMPILE_TOTAL_TIMEOUT,
+        RECOMPILE_UNRESPONSIVE_BUDGET, follow_up_compile_converged, ReloadBaseline,
+        ReloadStateMessage,
         native_background_hook_markers_present, parse_unity_hub_editor_locations,
         parse_unity_status_message, pipe_response_transient_broker_error, play_mode_target_status,
         read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
@@ -7692,6 +8110,7 @@ mod tests {
         UNITY_EDITOR_STATUS_PLAYING,
     };
     use serde_json::json;
+    use std::time::Duration;
 
     fn result_file(summary: &str) -> String {
         summary
@@ -7846,7 +8265,16 @@ mod tests {
                 None,
                 Some("recompile_result_operation_mismatch"),
             )),
-            Ok(RecompilePollState::Transient)
+            Ok(RecompilePollState::OperationMismatch)
+        );
+        // A stalled main thread is a reason to keep waiting, not a failure.
+        assert_eq!(
+            classify_recompile_poll_response(&pipe_response(
+                false,
+                None,
+                Some("native_main_thread_unresponsive"),
+            )),
+            Ok(RecompilePollState::EditorBusy)
         );
 
         let error = classify_recompile_poll_response(&pipe_response(
@@ -7856,6 +8284,99 @@ mod tests {
         ))
         .expect_err("no compilation is terminal");
         assert!(error.contains("没有开始编译"), "{error}");
+    }
+
+    #[test]
+    fn recompile_start_rejections_are_resendable_or_adoptable() {
+        // Rejected before it reached Unity: safe to resend later.
+        assert_eq!(
+            classify_recompile_start_response(&pipe_response(
+                false,
+                None,
+                Some("native_main_thread_unresponsive"),
+            )),
+            Ok(RecompileStartAck::EditorBusyNotSent)
+        );
+        // Current plugins name the active operation.
+        assert_eq!(
+            classify_recompile_start_response(&pipe_response(
+                false,
+                None,
+                Some("recompile_in_progress; operation_id=recompile-abc; Unity 重编译请求正在进行中。"),
+            )),
+            Ok(RecompileStartAck::InProgress {
+                operation_id: Some("recompile-abc".to_string())
+            })
+        );
+        // Older plugins only say so in text.
+        assert_eq!(
+            classify_recompile_start_response(&pipe_response(
+                false,
+                None,
+                Some("Unity 重编译请求正在进行中。"),
+            )),
+            Ok(RecompileStartAck::InProgress { operation_id: None })
+        );
+        assert_eq!(
+            recompile_in_progress_operation("recompile_in_progress; operation_id=; text"),
+            Some(None)
+        );
+        let error = classify_recompile_start_response(&pipe_response(
+            false,
+            None,
+            Some("Unity 没有开始编译。 请求编译失败：boom"),
+        ))
+        .expect_err("a real start failure stays terminal");
+        assert!(error.contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn a_follow_up_compile_after_a_no_op_verdict_counts_as_compiled() {
+        let settled = |session: &str, serial: i64| ReloadStateMessage {
+            session_id: session.to_string(),
+            domain_generation: "g".to_string(),
+            converged_serial: serial,
+            is_compiling: false,
+            is_updating: false,
+        };
+        let baseline = ReloadBaseline {
+            session_id: "s1".to_string(),
+            converged_serial: 4,
+        };
+        assert!(!follow_up_compile_converged(Some(&baseline), &settled("s1", 4)));
+        assert!(follow_up_compile_converged(Some(&baseline), &settled("s1", 5)));
+        // A different editor process loaded the current sources from scratch.
+        assert!(follow_up_compile_converged(Some(&baseline), &settled("s2", 0)));
+        // Without a baseline nothing can be claimed.
+        assert!(!follow_up_compile_converged(None, &settled("s1", 9)));
+
+        // Older plugins omit the flags: settled, as before.
+        let legacy: ReloadStateMessage = serde_json::from_str(
+            r#"{"session_id":"s1","domain_generation":"g","converged_serial":4}"#,
+        )
+        .unwrap();
+        assert!(!legacy.is_compiling && !legacy.is_updating);
+    }
+
+    #[test]
+    fn editor_busy_verdict_waits_within_budget_unless_the_timeline_says_stuck() {
+        assert_eq!(
+            editor_busy_verdict(false, true, Duration::from_secs(600)),
+            EditorBusyVerdict::Responsive
+        );
+        assert_eq!(
+            editor_busy_verdict(true, false, Duration::from_secs(45)),
+            EditorBusyVerdict::KeepWaiting
+        );
+        assert_eq!(
+            editor_busy_verdict(true, true, Duration::from_secs(5)),
+            EditorBusyVerdict::GiveUp
+        );
+        assert_eq!(
+            editor_busy_verdict(true, false, RECOMPILE_UNRESPONSIVE_BUDGET),
+            EditorBusyVerdict::GiveUp
+        );
+        assert!(RECOMPILE_UNRESPONSIVE_BUDGET < RECOMPILE_TOTAL_TIMEOUT);
     }
 
     #[test]
