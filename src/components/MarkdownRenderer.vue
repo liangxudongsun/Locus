@@ -33,7 +33,8 @@ import {
 import { useSurfaceContentReadiness } from "../composables/surfaceContentReadiness";
 import { useInternalDragController } from "../composables/useInternalDrag";
 import { useTextViewerZoom } from "../composables/useTextViewerZoom";
-import { workspaceFileChangeMatches } from "../composables/useFileChangeRevalidation";
+import { workspaceFileChangeInScope } from "../composables/useFileChangeRevalidation";
+import { collectMarkdownFileDependencies, MarkdownFileDependencies } from "../composables/markdownFileDependencies";
 import { resolveMarkdownImage } from "../services/markdownImage";
 import { subscribeWorkspaceFileChanges } from "../services/workspaceExplorer";
 import type { RuntimeUnsubscribe } from "../services/locusRuntime";
@@ -74,6 +75,11 @@ const notificationStore = useNotificationStore();
 const openViewPackage = useOpenView();
 const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
+const markdownWorkspaceRef = computed(() => props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef);
+const markdownWorkingDir = computed(() => {
+  const scope = markdownWorkspaceRef.value;
+  return (scope && workspaceContextStore.checkoutsById?.[scope.checkoutId]?.root) || projectStore.workingDir;
+});
 const internalDrag = useInternalDragController();
 const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
@@ -83,11 +89,15 @@ const markdownPreviewRevisionEpoch = ref(0);
 const appContext = getCurrentInstance()?.appContext ?? null;
 const markdownUnityObjectPreviewHosts = new Set<HTMLElement>();
 const markdownUnityPropertyFenceHosts = new Set<HTMLElement>();
+const markdownUnityPropertyFenceSources = new WeakMap<HTMLElement, string>();
 let markdownViewRefLoadRun = 0;
 let markdownInlinePathStatusLoadRun = 0;
 let markdownInlinePathStatusKey = "";
 let releaseWorkspaceFileChanges: RuntimeUnsubscribe | null = null;
 let markdownRendererUnmounted = false;
+let fileDependencies = new MarkdownFileDependencies();
+let fileRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let invalidateMarkdownImages = false;
 
 function escapeRegExp(source: string): string {
   return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -182,6 +192,8 @@ const parsedMarkdownHtml = computed(() => {
   return markdownEngine.parse(normalizeMarkdownForRender(content)) as string;
 });
 
+const inlineFilePathCandidates = computed(() => collectInlineCodePathCandidates(parsedMarkdownHtml.value));
+
 function resolveInlinePathStatus(path: string): MarkdownPathStatus | null | undefined {
   return inlinePathStatuses.value.get(normalizeMarkdownPathStatusKey(path));
 }
@@ -214,8 +226,8 @@ function applyInlinePathStatuses(statuses: Map<string, MarkdownPathStatus>) {
 
 async function loadInlinePathStatuses(html: string) {
   const candidates = collectInlineCodePathCandidates(html);
-  const focusedWorkspaceRef = workspaceContextStore.focusedWorkspaceRef;
-  const nextKey = `${focusedWorkspaceRef?.checkoutId ?? ""}@${focusedWorkspaceRef?.expectedGeneration ?? ""}\n${projectStore.workingDir}\n${candidates.join("\n")}`;
+  const focusedWorkspaceRef = markdownWorkspaceRef.value;
+  const nextKey = `${focusedWorkspaceRef?.checkoutId ?? ""}@${focusedWorkspaceRef?.expectedGeneration ?? ""}@${focusedWorkspaceRef?.expectedMaterializationEpoch ?? ""}\n${markdownWorkingDir.value}\n${candidates.join("\n")}`;
   if (nextKey === markdownInlinePathStatusKey) return;
   markdownInlinePathStatusKey = nextKey;
   const run = ++markdownInlinePathStatusLoadRun;
@@ -232,7 +244,7 @@ async function loadInlinePathStatuses(html: string) {
 
   // Known statuses render with the text itself, so a remounted transcript
   // never swaps code spans for file references after its first frame.
-  const cached = peekCachedMarkdownPathStatuses(projectStore.workingDir, candidates, workspaceRef);
+  const cached = peekCachedMarkdownPathStatuses(markdownWorkingDir.value, candidates, workspaceRef);
   applyInlinePathStatuses(cached.statuses);
   if (!cached.missing.length && !cached.stale) return;
 
@@ -241,7 +253,7 @@ async function loadInlinePathStatuses(html: string) {
   const release = cached.missing.length ? surfaceContentReadiness?.hold() : undefined;
   try {
     const statuses = await loadCachedMarkdownPathStatuses(
-      projectStore.workingDir,
+      markdownWorkingDir.value,
       candidates,
       workspaceRef,
     );
@@ -421,7 +433,8 @@ function mountMarkdownUnityObjectPreviews() {
 }
 
 function markdownUnityPropertySourceFromHost(host: HTMLElement): string {
-  return host.querySelector("[data-md-unity-property-source='true']")?.textContent ?? "";
+  return host.querySelector("[data-md-unity-property-source='true']")?.textContent
+    ?? markdownUnityPropertyFenceSources.get(host) ?? "";
 }
 
 function mountMarkdownUnityPropertyFences() {
@@ -436,6 +449,7 @@ function mountMarkdownUnityPropertyFences() {
   for (const host of hosts) {
     const source = markdownUnityPropertySourceFromHost(host);
     if (!source.trim()) continue;
+    markdownUnityPropertyFenceSources.set(host, source);
 
     const vnode = h(UnityPropertyFenceBlock, { source });
     if (appContext) {
@@ -448,6 +462,11 @@ function mountMarkdownUnityPropertyFences() {
 }
 
 function refreshMarkdownEnhancements() {
+  if (markdownRendererUnmounted) return;
+  fileDependencies = collectMarkdownFileDependencies(
+    rootRef.value, markdownWorkingDir.value, inlineFilePathCandidates.value,
+    markdownUnityPropertySourceFromHost,
+  );
   mountMarkdownUnityPropertyFences();
   mountMarkdownUnityObjectPreviews();
   void resolveMarkdownImages();
@@ -487,7 +506,7 @@ async function resolveMarkdownImages() {
   if (!root) return;
 
   const run = ++markdownImageResolveRun;
-  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
+  const workspaceRef = markdownWorkspaceRef.value;
   const images = Array.from(root.querySelectorAll<HTMLImageElement>("img[data-md-image-source]"));
   for (const image of images) {
     const source = image.dataset.mdImageSource?.trim() ?? "";
@@ -501,7 +520,7 @@ async function resolveMarkdownImages() {
       continue;
     }
 
-    const cacheKey = `${workspaceRef?.checkoutId ?? ""}@${workspaceRef?.expectedGeneration ?? ""}:${source}`;
+    const cacheKey = `${workspaceRef?.checkoutId ?? ""}@${workspaceRef?.expectedGeneration ?? ""}@${workspaceRef?.expectedMaterializationEpoch ?? ""}:${source}`;
     const cached = markdownImageCache.get(cacheKey);
     if (cached) {
       applyResolvedMarkdownImage(image, source, cached);
@@ -516,7 +535,6 @@ async function resolveMarkdownImages() {
         url: preview.url,
         displayPath: preview.displayPath || source,
       };
-      markdownImageCache.set(cacheKey, resolved);
       if (
         run !== markdownImageResolveRun
         || !image.isConnected
@@ -524,6 +542,7 @@ async function resolveMarkdownImages() {
       ) {
         continue;
       }
+      markdownImageCache.set(cacheKey, resolved);
       applyResolvedMarkdownImage(image, source, resolved);
     } catch (error) {
       if (
@@ -550,12 +569,23 @@ watch(
 
 watch(
   () => [
-    projectStore.workingDir,
-    workspaceContextStore.focusedWorkspaceRef?.checkoutId ?? "",
-    workspaceContextStore.focusedWorkspaceRef?.expectedGeneration ?? null,
+    markdownWorkingDir.value,
+    markdownWorkspaceRef.value?.checkoutId ?? "",
+    markdownWorkspaceRef.value?.expectedGeneration ?? null,
+    markdownWorkspaceRef.value?.expectedMaterializationEpoch ?? null,
   ],
   () => {
+    markdownImageResolveRun++;
+    markdownImageCache.clear();
+    if (fileRefreshTimer !== null) clearTimeout(fileRefreshTimer);
+    fileRefreshTimer = null;
+    invalidateMarkdownImages = false;
+    fileDependencies = new MarkdownFileDependencies();
+    for (const image of rootRef.value?.querySelectorAll<HTMLImageElement>("img[data-md-image-source]") ?? []) {
+      delete image.dataset.mdImageResolvedFor;
+    }
     void loadInlinePathStatuses(parsedMarkdownHtml.value);
+    void nextTick(refreshMarkdownEnhancements);
   },
 );
 
@@ -568,28 +598,36 @@ watch(
 );
 
 void subscribeWorkspaceFileChanges((event) => {
-  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
-  if (!workspaceFileChangeMatches(event, workspaceRef, event.payload.path)) return;
-  const normalizedContent = props.content.replace(/\\/g, "/").toLocaleLowerCase();
-  const normalizedPath = event.payload.path.replace(/\\/g, "/").toLocaleLowerCase();
-  if (!normalizedPath || !normalizedContent.includes(normalizedPath)) return;
-  markdownPreviewRevisionEpoch.value += 1;
-  if (/\.(?:png|jpe?g|gif|bmp|webp|svg)$/i.test(normalizedPath)) {
-    markdownImageCache.clear();
-    for (const image of rootRef.value?.querySelectorAll<HTMLImageElement>(
-      "img[data-md-image-source]",
-    ) ?? []) {
-      delete image.dataset.mdImageResolvedFor;
+  if (fileDependencies.empty || !workspaceFileChangeInScope(event, markdownWorkspaceRef.value)) return;
+  const { path } = event.payload;
+  if (!fileDependencies.matches(path)) return;
+  invalidateMarkdownImages ||= fileDependencies.matches(path, true);
+  if (fileRefreshTimer !== null) return;
+  // Fixed window: a multi-path batch refreshes a referenced preview only once,
+  // while a continuous stream cannot postpone its refresh indefinitely.
+  fileRefreshTimer = setTimeout(() => {
+    fileRefreshTimer = null;
+    if (markdownRendererUnmounted) return;
+    markdownPreviewRevisionEpoch.value += 1;
+    if (invalidateMarkdownImages) {
+      markdownImageResolveRun++;
+      markdownImageCache.clear();
+      for (const image of rootRef.value?.querySelectorAll<HTMLImageElement>("img[data-md-image-source]") ?? []) {
+        delete image.dataset.mdImageResolvedFor;
+      }
+      invalidateMarkdownImages = false;
     }
-  }
-  void nextTick(refreshMarkdownEnhancements);
-}).then((release) => {
+    void nextTick(refreshMarkdownEnhancements);
+  }, 100);
+}, () => markdownWorkspaceRef.value).then((release) => {
   if (markdownRendererUnmounted) release();
   else releaseWorkspaceFileChanges = release;
 });
 
 onBeforeUnmount(() => {
   markdownRendererUnmounted = true;
+  if (fileRefreshTimer !== null) clearTimeout(fileRefreshTimer);
+  fileRefreshTimer = null;
   releaseWorkspaceFileChanges?.();
   releaseWorkspaceFileChanges = null;
   markdownImageResolveRun++;
