@@ -46,7 +46,7 @@ namespace Locus
         // Capabilities the managed executor advertises (mirrors the managed
         // executor features the broker can route through this domain).
         private const string ManagedCapabilities =
-            "managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1,recompile_result_idempotent_v1,recompile_operation_id_v1";
+            "managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1,recompile_result_idempotent_v1,recompile_operation_id_v1,recompile_in_progress_operation_v1,execute_loop_guard_v1";
 
         private static volatile bool _nativeBridgeActive;
         private static long _nativeGeneration;
@@ -112,6 +112,27 @@ namespace Locus
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
         private static extern void locus_overlay_push(byte[] line, int lineLen);
 
+        // Optional exports (newer locus_native). An editor that updated the
+        // plugin keeps the previously loaded DLL until restart, so every call
+        // below tolerates a missing entry point and falls back.
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void locus_set_compile_result(
+            byte[] operationId, int operationIdLen, byte[] result, int resultLen);
+
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern ulong locus_execution_cancel_seq();
+
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern int locus_execution_cancel_requested(
+            byte[] executionId, int executionIdLen, ulong sinceSeq);
+
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern long locus_main_thread_stall_ms();
+
+        private static volatile bool _nativeCompileResultAvailable = true;
+        private static volatile bool _nativeExecutionCancelAvailable = true;
+        private static volatile bool _nativeMainThreadStallAvailable = true;
+
         private static volatile bool _nativeOverlayConnected;
 
         // ───────────────── Lifecycle (called from LocusBridge.cs) ─────────────────
@@ -148,6 +169,15 @@ namespace Locus
             NativeSetCapabilities(ManagedCapabilities);
             NativeSetManagedState(ManagedStateReady);
             _nativeBridgeActive = true;
+            // A freshly loaded broker starts without the register; seed it so
+            // native get_compile_result never answers with a stale view.
+            string persistedCompileResult = SessionState.GetString(SessionKey_RecompileResult, "");
+            if (!string.IsNullOrEmpty(persistedCompileResult))
+            {
+                NativePublishCompileResult(
+                    SessionState.GetString(SessionKey_RecompileOperationId, ""),
+                    persistedCompileResult);
+            }
             Debug.Log("[Locus] Native broker bridge active (generation " + _nativeGeneration + ").");
 
             // Reconcile the in-process background hook (Phase 6). The native
@@ -412,6 +442,88 @@ namespace Locus
             if (!_nativeBridgeActive || !_nativeExecutionTrackingAvailable) return;
             try { locus_managed_execution(active ? 1 : 0); }
             catch (EntryPointNotFoundException) { _nativeExecutionTrackingAvailable = false; }
+        }
+
+        /// <summary>
+        /// Mirror the recompile register into the broker so it can answer
+        /// get_compile_result while a compile, import or post-reload
+        /// initializer holds the main thread. Runs only on register changes.
+        /// </summary>
+        private static void NativePublishCompileResult(string operationId, string result)
+        {
+            // Changes made before the bridge registers in this domain are
+            // published by the seed in NativeStartIfEnabled.
+            if (!_nativeCompileResultAvailable || !_nativeBridgeActive)
+                return;
+            try
+            {
+                byte[] op = Utf8NoBom.GetBytes(operationId ?? "");
+                byte[] value = Utf8NoBom.GetBytes(result ?? "");
+                locus_set_compile_result(op, op.Length, value, value.Length);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _nativeCompileResultAvailable = false;
+            }
+            catch (DllNotFoundException)
+            {
+                _nativeCompileResultAvailable = false;
+            }
+        }
+
+        /// <summary>Current native cancel sequence, or 0 when unsupported.</summary>
+        internal static ulong NativeExecutionCancelSeq()
+        {
+            if (!_nativeBridgeActive || !_nativeExecutionCancelAvailable)
+                return 0;
+            try
+            {
+                return locus_execution_cancel_seq();
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _nativeExecutionCancelAvailable = false;
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// True when the broker recorded a cancel for this execution after
+        /// <paramref name="sinceSeq"/>. Safe off the main thread.
+        /// </summary>
+        internal static bool NativeExecutionCancelRequested(string executionId, ulong sinceSeq)
+        {
+            if (!_nativeBridgeActive || !_nativeExecutionCancelAvailable)
+                return false;
+            try
+            {
+                byte[] id = Utf8NoBom.GetBytes(executionId ?? "");
+                return locus_execution_cancel_requested(id, id.Length, sinceSeq) != 0;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _nativeExecutionCancelAvailable = false;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Milliseconds since the editor loop last pulsed, -1 when unknown or
+        /// unsupported. Read off the main thread; costs the editor nothing.
+        /// </summary>
+        internal static long NativeMainThreadStallMs()
+        {
+            if (!_nativeBridgeActive || !_nativeMainThreadStallAvailable)
+                return -1;
+            try
+            {
+                return locus_main_thread_stall_ms();
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _nativeMainThreadStallAvailable = false;
+                return -1;
+            }
         }
 
         private static void NativePublishEditorStatusNow()

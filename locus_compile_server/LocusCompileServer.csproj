@@ -18,6 +18,12 @@
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
   </ItemGroup>
 
+  <!-- Shared with the Unity plugin so both snippet compile paths insert the
+       same loop cancellation checks. -->
+  <ItemGroup>
+    <Compile Include="..\locus_unity\Editor\ExecuteCodeAsync\LocusSnippetLoopGuard.cs" Link="Shared\LocusSnippetLoopGuard.cs" />
+  </ItemGroup>
+
   <!-- The xunit test project lives in Tests/ next to the sources; keep it
        out of the server assembly. -->
   <ItemGroup>

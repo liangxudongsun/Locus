@@ -42,10 +42,29 @@ namespace Locus
         {
             public readonly Func<ScriptGlobals, ExecuteCodeContext, CancellationToken, Task<object>> Executor;
 
+            /// <summary>
+            /// Static field the loop guard reads at every loop iteration
+            /// (<see cref="LocusSnippetLoopGuard"/>); null when the snippet
+            /// has no loops or came from a compiler without the guard.
+            /// </summary>
+            public readonly FieldInfo LoopCancelField;
+
             public CompiledAsyncSnippet(
-                Func<ScriptGlobals, ExecuteCodeContext, CancellationToken, Task<object>> executor)
+                Func<ScriptGlobals, ExecuteCodeContext, CancellationToken, Task<object>> executor,
+                Type hostType)
             {
                 Executor = executor;
+                LoopCancelField = FindLoopCancelField(hostType);
+            }
+
+            private static FieldInfo FindLoopCancelField(Type hostType)
+            {
+                if (hostType == null)
+                    return null;
+                FieldInfo field = hostType.GetField(
+                    LocusSnippetLoopGuard.FieldName,
+                    BindingFlags.Public | BindingFlags.Static);
+                return field != null && field.FieldType == typeof(int) ? field : null;
             }
         }
 
@@ -699,6 +718,11 @@ namespace Locus
             if (requestState == null)
                 return;
 
+            // Thread-pool monitor, alive only while this execution is. Every
+            // check below is an atomic read in the native broker.
+            ulong cancelSeqAtStart = NativeExecutionCancelSeq();
+            ulong lastCancelSeq = 0;
+
             try
             {
                 while (!requestState.IsCancellationRequested)
@@ -708,11 +732,36 @@ namespace Locus
                     if (requestState.IsCancellationRequested)
                         return;
 
+                    // A snippet holding the main thread can never dequeue its
+                    // own cancel request; the broker records it for us instead.
+                    // The first poll also catches a cancel that raced the start.
+                    ulong cancelSeq = NativeExecutionCancelSeq();
+                    if (cancelSeq != lastCancelSeq)
+                    {
+                        lastCancelSeq = cancelSeq;
+                        if (NativeExecutionCancelRequested(requestState.ExecutionId, cancelSeqAtStart))
+                        {
+                            requestState.Cancel();
+                            requestState.ResetProgress();
+                            Debug.LogWarning("[Locus] execute_code canceled by the Locus client");
+                            return;
+                        }
+                    }
+
                     if (requestState.ClientHeartbeatCount <= 0)
                         continue;
 
                     if (requestState.ClientHeartbeatIdleSeconds < ExecuteClientHeartbeatTimeoutMs / 1000.0)
                         continue;
+
+                    // The client's progress polls queue behind a busy main
+                    // thread (often this very snippet). Silence then says
+                    // nothing about the client, so do not count it.
+                    if (ClientHeartbeatsUndeliverable())
+                    {
+                        requestState.TouchClientHeartbeat();
+                        continue;
+                    }
 
                     requestState.Cancel();
                     requestState.ResetProgress();
@@ -727,6 +776,18 @@ namespace Locus
             {
                 Debug.LogError("[Locus] execute_code heartbeat monitor failed: " + ex);
             }
+        }
+
+        private const long ClientHeartbeatMainThreadStallMs = 2000;
+
+        private static bool ClientHeartbeatsUndeliverable()
+        {
+            long stallMs = NativeMainThreadStallMs();
+            if (stallMs >= 0)
+                return stallMs >= ClientHeartbeatMainThreadStallMs;
+            // Older broker without the stall readout: a connected client is
+            // still there, so only its disconnect may end the execution.
+            return HasConnectedDesktopClient();
         }
 
         private static async Task<PipeEnvelope> HandleExecuteCode(string requestId, string code)
@@ -902,7 +963,7 @@ namespace Locus
                         requestId,
                         "ExecuteAsync delegate bound in " + DebugElapsedMilliseconds(loadStarted) + "ms");
                 }
-                return new CompiledAsyncSnippet(executor);
+                return new CompiledAsyncSnippet(executor, hostType);
             }
             catch (Exception ex)
             {
@@ -1234,6 +1295,8 @@ namespace Locus
                     path: "LocusRuntimeAsyncSnippet.cs",
                     encoding: Utf8NoBom
                 );
+                // Same loop cancellation checks as the compile-server path.
+                syntaxTree = LocusSnippetLoopGuard.Apply(syntaxTree, hostTypeName);
             }
             catch (Exception ex)
             {
@@ -1297,7 +1360,7 @@ namespace Locus
                                 executeMethod
                             );
 
-                    snippet = new CompiledAsyncSnippet(executor);
+                    snippet = new CompiledAsyncSnippet(executor, hostType);
                     return true;
                 }
                 catch (Exception ex)
@@ -1509,6 +1572,7 @@ namespace Locus
 
             ExecuteCodeContext ctx = null;
             ScriptGlobals globals = null;
+            CancellationTokenRegistration loopGuardRegistration = default(CancellationTokenRegistration);
 
             try
             {
@@ -1519,6 +1583,7 @@ namespace Locus
                 execution.Globals = globals;
                 ctx = new ExecuteCodeContext(execution.Cancellation, execution.TouchActivity, requestState);
                 ctx.InitializeProfilerOutput(globals.print);
+                loopGuardRegistration = BindSnippetLoopGuard(snippet, execution.Cancellation.Token);
 
                 object returnValue = await snippet.Executor(globals, ctx, execution.Cancellation.Token);
 
@@ -1549,6 +1614,7 @@ namespace Locus
             {
                 try
                 {
+                    loopGuardRegistration.Dispose();
                     if (ctx != null)
                     {
                         ctx.DisposeProfiler();
@@ -1566,6 +1632,41 @@ namespace Locus
                         EndAsyncExecuteRuntime();
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Arm the snippet's loop guard: cancellation of this execution (user
+        /// stop, inactivity timeout, client loss, native cancel signal) sets
+        /// the host field, and every guarded loop leaves at its next
+        /// iteration even while it holds the main thread.
+        /// </summary>
+        private static CancellationTokenRegistration BindSnippetLoopGuard(
+            CompiledAsyncSnippet snippet,
+            CancellationToken token)
+        {
+            FieldInfo field = snippet != null ? snippet.LoopCancelField : null;
+            if (field == null)
+                return default(CancellationTokenRegistration);
+
+            try
+            {
+                field.SetValue(null, 0);
+                return token.Register(delegate
+                {
+                    try
+                    {
+                        field.SetValue(null, 1);
+                    }
+                    catch
+                    {
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[Locus] Snippet loop guard could not be armed: " + ex.Message);
+                return default(CancellationTokenRegistration);
             }
         }
 

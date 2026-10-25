@@ -117,9 +117,13 @@ mod imp {
     };
 
     const NATIVE_CAPABILITIES: &str =
-        "broker_v1,broker_state_mmf_v1,broker_queue_limits_v1,broker_request_accepted_v1,broker_main_thread_liveness_v1,broker_main_thread_stack_v1";
+        "broker_v1,broker_state_mmf_v1,broker_queue_limits_v1,broker_request_accepted_v1,broker_main_thread_liveness_v1,broker_main_thread_stack_v1,broker_compile_result_v1,broker_execution_cancel_v1,broker_stack_name_cache_v1";
     const REQUEST_ACCEPTED_EVENT: &str = "locus-request-accepted";
     const STATUS_EVENT_BUFFER_LIMIT: usize = 256;
+    /// Cancellation signals retained for managed execution monitors. Each
+    /// monitor only reads entries newer than the sequence it started at.
+    const EXECUTION_CANCEL_LOG_LIMIT: usize = 64;
+    const NO_ACTIVE_RECOMPILE_ERROR: &str = "Unity 没有开始编译。未找到活动重编译请求。";
     const MAX_PENDING_REQUESTS: usize = 128;
     const MAX_INFLIGHT_REQUESTS: usize = 64;
     const MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
@@ -385,6 +389,19 @@ mod imp {
         /// inputs through FFI; this broker owns the cross-process memory plane.
         state_plane: Mutex<Option<NativeStatePlane>>,
 
+        /// Mirror of the managed recompile register `(operation id, result)`.
+        /// The managed side publishes every change; once published, the broker
+        /// answers `get_compile_result` itself so a compile, import or
+        /// post-reload initializer that holds the main thread cannot hide the
+        /// result. `None` until a plugin that publishes it has run.
+        compile_result: Mutex<Option<(String, String)>>,
+
+        /// `cancel_execute_code` signals recorded off the main thread. A stuck
+        /// snippet cannot dequeue its own cancel request, so managed monitors
+        /// (thread pool) poll this log instead.
+        cancel_seq: AtomicU64,
+        cancel_log: Mutex<VecDeque<(u64, String)>>,
+
         process_id: u32,
         process_path: String,
     }
@@ -456,6 +473,9 @@ mod imp {
                 event_seq: AtomicU64::new(0),
                 events: Mutex::new(VecDeque::new()),
                 state_plane: Mutex::new(state_plane),
+                compile_result: Mutex::new(None),
+                cancel_seq: AtomicU64::new(0),
+                cancel_log: Mutex::new(VecDeque::new()),
                 process_id: std::process::id(),
                 process_path: std::env::current_exe()
                     .ok()
@@ -941,6 +961,94 @@ mod imp {
                     >= crate::heartbeat::UNRESPONSIVE_AFTER.as_millis() as i64
         }
 
+        /// Milliseconds since the editor loop last pulsed, or `-1` when the
+        /// managed executor is not registered (initializing, reloading,
+        /// quitting) or no pulse has been observed in this generation.
+        fn main_thread_stall_ms(&self) -> i64 {
+            if self.managed_state() != MANAGED_STATE_READY {
+                return -1;
+            }
+            self.heartbeat_age_ms.load(Ordering::Relaxed)
+        }
+
+        // ── Recompile result register ──────────────────────────────────────
+
+        fn set_compile_result(&self, operation_id: String, result: String) {
+            if let Ok(mut guard) = self.compile_result.lock() {
+                *guard = Some((operation_id.trim().to_string(), result));
+            }
+        }
+
+        fn compile_result_published(&self) -> bool {
+            self.compile_result
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false)
+        }
+
+        /// Answer `get_compile_result` exactly like the managed handler
+        /// (`LocusBridge.cs`, case "get_compile_result"), but without the
+        /// editor main thread. Terminal results stay readable (last-value
+        /// register); the next `request_recompile` publishes "starting".
+        fn respond_compile_result(&self, id: &str, requested_operation_id: &str) {
+            let Some((active_operation_id, result)) = self
+                .compile_result
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+            else {
+                self.respond_error(id, NO_ACTIVE_RECOMPILE_ERROR);
+                return;
+            };
+            let requested = requested_operation_id.trim();
+            if !requested.is_empty() && requested != active_operation_id {
+                self.respond_error(id, "recompile_result_operation_mismatch");
+                return;
+            }
+            match result.as_str() {
+                "" => self.respond_error(id, NO_ACTIVE_RECOMPILE_ERROR),
+                "awaiting_reload" => self.respond_ok(id, Some("pending".to_string())),
+                error if error.starts_with("error:") => {
+                    self.respond_error(id, &error["error:".len()..])
+                }
+                _ => self.respond_ok(id, Some(result.clone())),
+            }
+        }
+
+        // ── Execution cancellation signals ─────────────────────────────────
+
+        /// Record a cancel for `execution_id` (empty = every active
+        /// execution). Readers only see entries newer than their own start.
+        fn signal_execution_cancel(&self, execution_id: &str) -> u64 {
+            let seq = self.cancel_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Ok(mut log) = self.cancel_log.lock() {
+                if log.len() >= EXECUTION_CANCEL_LOG_LIMIT {
+                    log.pop_front();
+                }
+                log.push_back((seq, execution_id.trim().to_string()));
+            }
+            seq
+        }
+
+        /// A cancel naming this execution always applies (ids are unique, and
+        /// the cancel may arrive before the managed monitor starts). A cancel
+        /// for every execution only applies to monitors older than it.
+        fn execution_cancel_requested(&self, execution_id: &str, since_seq: u64) -> bool {
+            let execution_id = execution_id.trim();
+            self.cancel_log
+                .lock()
+                .map(|log| {
+                    log.iter().any(|(seq, target)| {
+                        if target.is_empty() {
+                            *seq > since_seq
+                        } else {
+                            !execution_id.is_empty() && target == execution_id
+                        }
+                    })
+                })
+                .unwrap_or(false)
+        }
+
         fn execution_activity(&self, active: bool) {
             if active {
                 self.active_executions.fetch_add(1, Ordering::Relaxed);
@@ -993,12 +1101,19 @@ mod imp {
                 .filter(|message| !message.trim().is_empty())
                 .and_then(|message| serde_json::from_str::<crate::hang_stack::CaptureRequest>(message).ok())
                 .unwrap_or_default();
+            let mut request = request;
+            if self.managed_state() != MANAGED_STATE_READY {
+                // Mono is tearing down or building a domain; naming frames
+                // then could race the unload. Native frames are still useful.
+                request.resolve_managed = Some(false);
+            }
+            let generation = self.generation.load(Ordering::SeqCst);
             let broker = Arc::clone(self);
             let request_id = id.to_string();
             let thread_id = self.main_thread_id;
             let spawned = std::thread::Builder::new()
                 .name("locus-hang-capture".to_string())
-                .spawn(move || match crate::hang_stack::capture(thread_id, &request) {
+                .spawn(move || match crate::hang_stack::capture(thread_id, &request, generation) {
                     Ok(result) => match serde_json::to_string(&result) {
                         Ok(json) => broker.respond_ok(&request_id, Some(json)),
                         Err(error) => broker.respond_error(
@@ -1094,6 +1209,122 @@ mod imp {
             assert!(broker.enqueue("recovered".into(), b"{}".to_vec(), true).is_ok());
             broker.execution_activity(false);
             assert_eq!(broker.active_executions.load(Ordering::Relaxed), 0);
+        }
+
+        fn broker_with_writer() -> (Arc<Broker>, mpsc::Receiver<Vec<u8>>) {
+            let broker = Arc::new(Broker::new(
+                "F:/RegisterTest".to_string(),
+                r"\\.\pipe\locus_unity_native_register_test".to_string(),
+                1,
+            ));
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(32);
+            *broker.response_tx.lock().unwrap() = Some(tx);
+            (broker, rx)
+        }
+
+        fn next_response(rx: &mut mpsc::Receiver<Vec<u8>>) -> Value {
+            loop {
+                let frame = rx.try_recv().expect("broker frame");
+                let value: Value = serde_json::from_slice(&frame).unwrap();
+                if value["type"] == "response" {
+                    return value;
+                }
+            }
+        }
+
+        #[test]
+        fn compile_result_is_answered_without_the_main_thread_once_published() {
+            use std::sync::atomic::Ordering;
+            let (broker, mut rx) = broker_with_writer();
+            broker.set_managed_state(MANAGED_STATE_READY, 1, Some("editing".into()));
+
+            // Older managed plugins never publish: keep the managed path.
+            handle_line(&broker, br#"{"id":"r0","type":"get_compile_result","message":"op-1"}"#);
+            assert_eq!(broker.queue.lock().unwrap().len(), 1);
+            while rx.try_recv().is_ok() {}
+
+            // Published + main thread stalled: answered natively, not rejected.
+            broker.set_compile_result("op-1".into(), "awaiting_reload".into());
+            broker.heartbeat_age_ms.store(45_000, Ordering::Relaxed);
+            handle_line(&broker, br#"{"id":"r1","type":"get_compile_result","message":"op-1"}"#);
+            let response = next_response(&mut rx);
+            assert_eq!(response["reply_to"], "r1");
+            assert_eq!(response["ok"], true);
+            assert_eq!(response["message"], "pending");
+
+            // Also during a domain reload.
+            broker.set_managed_state(MANAGED_STATE_RELOADING, 1, None);
+            // The reload interrupts the still-queued r0 with its own error.
+            let interrupted = next_response(&mut rx);
+            assert_eq!(interrupted["reply_to"], "r0");
+            assert_eq!(interrupted["error"], "domain_reload_interrupted");
+            broker.set_compile_result("op-1".into(), "ok".into());
+            handle_line(&broker, br#"{"id":"r2","type":"get_compile_result","message":"op-1"}"#);
+            assert_eq!(next_response(&mut rx)["message"], "ok");
+
+            handle_line(&broker, br#"{"id":"r3","type":"get_compile_result","message":"op-2"}"#);
+            let mismatch = next_response(&mut rx);
+            assert_eq!(mismatch["ok"], false);
+            assert_eq!(mismatch["error"], "recompile_result_operation_mismatch");
+
+            broker.set_compile_result("op-3".into(), "error:CS1002: ; expected".into());
+            handle_line(&broker, br#"{"id":"r4","type":"get_compile_result","message":""}"#);
+            let failed = next_response(&mut rx);
+            assert_eq!(failed["ok"], false);
+            assert_eq!(failed["error"], "CS1002: ; expected");
+
+            broker.set_compile_result("op-4".into(), String::new());
+            handle_line(&broker, br#"{"id":"r5","type":"get_compile_result","message":"op-4"}"#);
+            assert_eq!(next_response(&mut rx)["error"], super::NO_ACTIVE_RECOMPILE_ERROR);
+        }
+
+        #[test]
+        fn cancel_is_signaled_off_the_main_thread_and_answered_when_stalled() {
+            use std::sync::atomic::Ordering;
+            let (broker, mut rx) = broker_with_writer();
+            broker.set_managed_state(MANAGED_STATE_READY, 1, Some("editing".into()));
+            let start = broker.cancel_seq.load(Ordering::SeqCst);
+
+            // Responsive: the managed handler still gets the request.
+            handle_line(&broker, br#"{"id":"c1","type":"cancel_execute_code","message":"exec-a"}"#);
+            assert_eq!(broker.queue.lock().unwrap().len(), 1);
+            assert!(broker.execution_cancel_requested("exec-a", start));
+            assert!(!broker.execution_cancel_requested("exec-b", start));
+            while rx.try_recv().is_ok() {}
+
+            // Stalled: the queue rejects, the broker answers, the signal lands.
+            broker.heartbeat_age_ms.store(31_000, Ordering::Relaxed);
+            let before_b = broker.cancel_seq.load(Ordering::SeqCst);
+            handle_line(&broker, br#"{"id":"c2","type":"cancel_execute_code","message":"exec-b"}"#);
+            let response = next_response(&mut rx);
+            assert_eq!(response["reply_to"], "c2");
+            assert_eq!(response["ok"], true);
+            assert!(broker.execution_cancel_requested("exec-b", before_b));
+            // A cancel naming the execution applies even if its monitor
+            // started after the signal (the cancel can race the start).
+            let after_b = broker.cancel_seq.load(Ordering::SeqCst);
+            assert!(broker.execution_cancel_requested("exec-b", after_b));
+            assert!(!broker.execution_cancel_requested("exec-z", after_b));
+
+            // Empty id cancels every execution that started before it, but
+            // never one that starts afterwards.
+            handle_line(&broker, br#"{"id":"c3","type":"cancel_execute_code","message":""}"#);
+            assert!(broker.execution_cancel_requested("exec-z", after_b));
+            let after_all = broker.cancel_seq.load(Ordering::SeqCst);
+            assert!(!broker.execution_cancel_requested("exec-later", after_all));
+        }
+
+        #[test]
+        fn main_thread_stall_is_unknown_outside_the_ready_state() {
+            use std::sync::atomic::Ordering;
+            let broker = Broker::new("F:/StallTest".into(), "stall-test".into(), 1);
+            broker.heartbeat_age_ms.store(12_000, Ordering::Relaxed);
+            assert_eq!(broker.main_thread_stall_ms(), -1);
+            broker.set_managed_state(MANAGED_STATE_READY, 1, Some("editing".into()));
+            broker.heartbeat_age_ms.store(12_000, Ordering::Relaxed);
+            assert_eq!(broker.main_thread_stall_ms(), 12_000);
+            broker.set_managed_state(MANAGED_STATE_RELOADING, 1, None);
+            assert_eq!(broker.main_thread_stall_ms(), -1);
         }
 
         #[test]
@@ -1315,32 +1546,66 @@ mod imp {
             return;
         }
 
+        let message = value.get("message").and_then(Value::as_str).unwrap_or("");
         match kind {
             "ping" => broker.respond_ok(id, Some("pong".to_string())),
             "status" => broker.respond_status(id),
             "bridge_capabilities" => broker.respond_ok(id, Some(broker.capabilities_string())),
             // Diagnosis of a wedged main thread must not depend on it.
             "main_thread_stack" => broker.capture_main_thread_stack(id, &value),
-            _ => match broker.managed_state() {
-                MANAGED_STATE_READY => match broker.enqueue(
+            // A compile, import or post-reload initializer can hold the main
+            // thread for minutes; the published register answers regardless.
+            // Plugins that never publish keep the managed path.
+            "get_compile_result" if broker.compile_result_published() => {
+                broker.respond_compile_result(id, message)
+            }
+            "cancel_execute_code" => {
+                // Signal first: a snippet stuck on the main thread can never
+                // dequeue this request, but its thread-pool monitor polls the
+                // signal. The managed handler still runs when it can.
+                broker.signal_execution_cancel(message);
+                if route_to_managed(broker, id, kind, trimmed).is_err() {
+                    broker.respond_ok(
+                        id,
+                        Some("execute_code cancellation signaled through the native broker".to_string()),
+                    );
+                }
+            }
+            _ => {
+                if let Err(code) = route_to_managed(broker, id, kind, trimmed) {
+                    broker.respond_error(id, code);
+                }
+            }
+        }
+    }
+
+    /// Queue a request for the managed executor, or return why it cannot take it.
+    fn route_to_managed(
+        broker: &Arc<Broker>,
+        id: &str,
+        kind: &str,
+        raw: &[u8],
+    ) -> Result<(), &'static str> {
+        match broker.managed_state() {
+            MANAGED_STATE_READY => {
+                broker.enqueue(
                     id.to_string(),
-                    trimmed.to_vec(),
+                    raw.to_vec(),
                     kind == "execute_code" || kind == "execute_loaded",
-                ) {
-                    Ok(()) => broker.emit_event(
-                        REQUEST_ACCEPTED_EVENT,
-                        serde_json::json!({
-                            "requestId": id,
-                            "requestType": kind,
-                        })
-                        .to_string(),
-                    ),
-                    Err(code) => broker.respond_error(id, code),
-                },
-                MANAGED_STATE_RELOADING => broker.respond_error(id, "managed_reloading"),
-                MANAGED_STATE_QUITTING => broker.respond_error(id, "unity_process_exiting"),
-                _ => broker.respond_error(id, "managed_not_ready"),
-            },
+                )?;
+                broker.emit_event(
+                    REQUEST_ACCEPTED_EVENT,
+                    serde_json::json!({
+                        "requestId": id,
+                        "requestType": kind,
+                    })
+                    .to_string(),
+                );
+                Ok(())
+            }
+            MANAGED_STATE_RELOADING => Err("managed_reloading"),
+            MANAGED_STATE_QUITTING => Err("unity_process_exiting"),
+            _ => Err("managed_not_ready"),
         }
     }
 
@@ -1543,6 +1808,33 @@ mod imp {
             .get()
             .map(|broker| broker.connected.load(Ordering::SeqCst))
             .unwrap_or(false)
+    }
+
+    pub fn set_compile_result(operation_id: String, result: String) {
+        if let Some(broker) = BROKER.get() {
+            broker.set_compile_result(operation_id, result);
+        }
+    }
+
+    pub fn execution_cancel_seq() -> u64 {
+        BROKER
+            .get()
+            .map(|broker| broker.cancel_seq.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    pub fn execution_cancel_requested(execution_id: &str, since_seq: u64) -> bool {
+        BROKER
+            .get()
+            .map(|broker| broker.execution_cancel_requested(execution_id, since_seq))
+            .unwrap_or(false)
+    }
+
+    pub fn main_thread_stall_ms() -> i64 {
+        BROKER
+            .get()
+            .map(|broker| broker.main_thread_stall_ms())
+            .unwrap_or(-1)
     }
 
     /// Copy the next queued request line into `buf`. Returns the byte length
@@ -2477,6 +2769,86 @@ pub extern "C" fn locus_has_connected_client() -> c_int {
     #[cfg(not(windows))]
     {
         0
+    }
+}
+
+/// Publish the managed recompile register (operation id + result string, as
+/// stored in `SessionState`). Called on every change; after the first call the
+/// broker answers `get_compile_result` without the editor main thread.
+///
+/// # Safety
+/// `operation_id`/`result` must each be valid for their stated lengths or null.
+#[no_mangle]
+pub unsafe extern "C" fn locus_set_compile_result(
+    operation_id: *const u8,
+    operation_id_len: i32,
+    result: *const u8,
+    result_len: i32,
+) {
+    #[cfg(windows)]
+    {
+        imp::set_compile_result(
+            string_from_raw(operation_id, operation_id_len),
+            string_from_raw(result, result_len),
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (operation_id, operation_id_len, result, result_len);
+    }
+}
+
+/// Monotonic count of `cancel_execute_code` signals. A managed execution
+/// monitor records it at start and calls
+/// [`locus_execution_cancel_requested`] only when it changes.
+#[no_mangle]
+pub extern "C" fn locus_execution_cancel_seq() -> u64 {
+    #[cfg(windows)]
+    {
+        imp::execution_cancel_seq()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// Return 1 when a cancel newer than `since_seq` targets `execution_id` (or
+/// every execution). Safe from any thread; never touches the main thread.
+///
+/// # Safety
+/// `execution_id` must be valid for `execution_id_len` bytes or null.
+#[no_mangle]
+pub unsafe extern "C" fn locus_execution_cancel_requested(
+    execution_id: *const u8,
+    execution_id_len: i32,
+    since_seq: u64,
+) -> c_int {
+    #[cfg(windows)]
+    {
+        let execution_id = string_from_raw(execution_id, execution_id_len);
+        c_int::from(imp::execution_cancel_requested(&execution_id, since_seq))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (execution_id, execution_id_len, since_seq);
+        0
+    }
+}
+
+/// Milliseconds since the editor loop last pulsed the broker heartbeat, or -1
+/// when unknown (executor not ready or no pulse yet). Read by thread-pool
+/// monitors to tell "the client stopped polling" from "our own main thread
+/// could not dequeue the client's polls".
+#[no_mangle]
+pub extern "C" fn locus_main_thread_stall_ms() -> i64 {
+    #[cfg(windows)]
+    {
+        imp::main_thread_stall_ms()
+    }
+    #[cfg(not(windows))]
+    {
+        -1
     }
 }
 

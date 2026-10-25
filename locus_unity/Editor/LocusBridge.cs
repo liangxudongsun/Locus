@@ -1001,6 +1001,9 @@ namespace Locus
         {
             _lastCompileResult = result;
             SessionState.SetString(SessionKey_RecompileResult, result ?? "");
+            NativePublishCompileResult(
+                SessionState.GetString(SessionKey_RecompileOperationId, ""),
+                result ?? "");
         }
 
         private static string GetCompileResult()
@@ -1018,6 +1021,9 @@ namespace Locus
         {
             _lastCompileResult = null;
             SessionState.SetString(SessionKey_RecompileResult, "");
+            NativePublishCompileResult(
+                SessionState.GetString(SessionKey_RecompileOperationId, ""),
+                "");
         }
 
         /// <summary>
@@ -1898,8 +1904,14 @@ namespace Locus
                             {
                                 if (SessionState.GetBool(SessionKey_RecompileInProgress, false))
                                 {
-                                    startCompletion.TrySetResult(
-                                        ErrorResponse(reqId, "Unity 重编译请求正在进行中。"));
+                                    // Machine-readable prefix: the desktop adopts
+                                    // the active operation (polls it to a terminal
+                                    // result) and then requests its own compile.
+                                    startCompletion.TrySetResult(ErrorResponse(
+                                        reqId,
+                                        "recompile_in_progress; operation_id=" +
+                                        SessionState.GetString(SessionKey_RecompileOperationId, "") +
+                                        "; Unity 重编译请求正在进行中。"));
                                     return;
                                 }
 

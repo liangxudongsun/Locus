@@ -22,8 +22,9 @@
 use std::ffi::{c_char, c_void, CStr};
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -285,7 +286,13 @@ pub fn prepare() {
     let _ = mono_api();
 }
 
-pub fn capture(thread_id: u32, request: &CaptureRequest) -> Result<CaptureResult, String> {
+/// `generation` is the managed domain generation; managed names cached for it
+/// are reused so repeated samples do not attach to Mono again.
+pub fn capture(
+    thread_id: u32,
+    request: &CaptureRequest,
+    generation: i64,
+) -> Result<CaptureResult, String> {
     if thread_id == 0 {
         return Err("main thread id is unknown".to_string());
     }
@@ -366,7 +373,7 @@ pub fn capture(thread_id: u32, request: &CaptureRequest) -> Result<CaptureResult
     let (managed, managed_status, managed_error) = if request.resolve_managed == Some(false) {
         (Vec::new(), "skipped".to_string(), None)
     } else {
-        resolve_managed_frames(&out)
+        resolve_managed_frames(&out, generation)
     };
 
     Ok(CaptureResult {
@@ -956,39 +963,113 @@ fn managed_lookups(samples: &[SampleOut]) -> Vec<(u64, u64)> {
     lookups
 }
 
-fn resolve_managed_frames(samples: &[SampleOut]) -> (Vec<ManagedFrame>, String, Option<String>) {
+/// Managed names resolved earlier in this domain generation, including
+/// addresses Mono did not own (`None`). JIT code is freed on domain unload, so
+/// a new generation starts empty. Repeated samples of one incident then name
+/// nothing new and never attach a thread to Mono.
+struct NameCache {
+    generation: i64,
+    names: HashMap<(u64, u64), Option<ManagedFrame>>,
+}
+
+const NAME_CACHE_LIMIT: usize = 8192;
+
+fn name_cache() -> &'static Mutex<NameCache> {
+    static CACHE: OnceLock<Mutex<NameCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(NameCache {
+            generation: i64::MIN,
+            names: HashMap::new(),
+        })
+    })
+}
+
+/// Split lookups into names already known for `generation` and lookups that
+/// still need Mono.
+fn cached_names(
+    generation: i64,
+    lookups: Vec<(u64, u64)>,
+) -> (Vec<ManagedFrame>, Vec<(u64, u64)>) {
+    let Ok(mut cache) = name_cache().lock() else {
+        return (Vec::new(), lookups);
+    };
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.names.clear();
+    }
+    let mut known = Vec::new();
+    let mut missing = Vec::new();
+    for key in lookups {
+        match cache.names.get(&key) {
+            Some(Some(frame)) => known.push(frame.clone()),
+            Some(None) => {}
+            None => missing.push(key),
+        }
+    }
+    (known, missing)
+}
+
+fn remember_names(generation: i64, looked_up: &[(u64, u64)], named: &[ManagedFrame]) {
+    let Ok(mut cache) = name_cache().lock() else { return };
+    if cache.generation != generation {
+        return;
+    }
+    if cache.names.len().saturating_add(looked_up.len()) > NAME_CACHE_LIMIT {
+        cache.names.clear();
+    }
+    for &(ip, lookup) in looked_up {
+        let frame = named.iter().find(|frame| frame.ip == ip).cloned();
+        cache.names.insert((ip, lookup), frame);
+    }
+}
+
+fn resolve_managed_frames(
+    samples: &[SampleOut],
+    generation: i64,
+) -> (Vec<ManagedFrame>, String, Option<String>) {
     let lookups = managed_lookups(samples);
     if lookups.is_empty() {
         return (Vec::new(), "skipped".to_string(), None);
     }
+    let (mut known, lookups) = cached_names(generation, lookups);
+    if lookups.is_empty() {
+        return (known, "ok".to_string(), None);
+    }
     if mono_api().is_none() {
-        return (Vec::new(), "unavailable".to_string(), Some("Mono runtime exports were not found".to_string()));
+        return (known, "unavailable".to_string(), Some("Mono runtime exports were not found".to_string()));
     }
     if MANAGED_NAMING_BUSY.swap(true, Ordering::SeqCst) {
         // A previous naming thread is still blocked inside Mono.
         return (
-            Vec::new(),
+            known,
             "blocked".to_string(),
             Some("a previous Mono lookup has not returned; Mono is likely blocked by the main thread".to_string()),
         );
     }
     let (tx, rx) = std::sync::mpsc::channel();
+    let thread_lookups = lookups.clone();
     let spawned = std::thread::Builder::new()
         .name("locus-hang-mono".to_string())
         .spawn(move || {
             let _busy = BusyGuard(&MANAGED_NAMING_BUSY);
-            let result = unsafe { name_with_mono(&lookups) };
+            let result = unsafe { name_with_mono(&thread_lookups) };
             let _ = tx.send(result);
         });
     if let Err(error) = spawned {
         MANAGED_NAMING_BUSY.store(false, Ordering::SeqCst);
-        return (Vec::new(), "error".to_string(), Some(format!("spawn failed: {error}")));
+        return (known, "error".to_string(), Some(format!("spawn failed: {error}")));
     }
     match rx.recv_timeout(MANAGED_NAMING_TIMEOUT) {
-        Ok(Ok(frames)) => (frames, "ok".to_string(), None),
-        Ok(Err(error)) => (Vec::new(), "error".to_string(), Some(error)),
+        Ok(Ok(frames)) => {
+            // Only a completed lookup may record misses; a timeout or error
+            // must not hide frames Mono could name later.
+            remember_names(generation, &lookups, &frames);
+            known.extend(frames);
+            (known, "ok".to_string(), None)
+        }
+        Ok(Err(error)) => (known, "error".to_string(), Some(error)),
         Err(_) => (
-            Vec::new(),
+            known,
             "timeout".to_string(),
             Some(format!(
                 "Mono did not answer within {}ms; it is likely blocked by the main thread",
@@ -1106,6 +1187,7 @@ mod tests {
                 max_frames: Some(64),
                 resolve_managed: Some(false),
             },
+            1,
         )
         .expect("capture");
         STOP.store(true, Ordering::Relaxed);
@@ -1139,9 +1221,37 @@ mod tests {
     }
 
     #[test]
+    fn name_cache_skips_known_addresses_until_the_generation_changes() {
+        let generation = 0x5EED_0001;
+        let frame = ManagedFrame {
+            ip: 0x10,
+            method: "User:Loop ()".to_string(),
+            assembly: Some("Assembly-CSharp".to_string()),
+            file: None,
+            line: None,
+            native_offset: 4,
+        };
+        let (known, missing) = cached_names(generation, vec![(0x10, 0x10), (0x20, 0x1F)]);
+        assert!(known.is_empty());
+        assert_eq!(missing.len(), 2);
+        // 0x20 is native: remembered as a miss so Mono is not asked again.
+        remember_names(generation, &missing, std::slice::from_ref(&frame));
+
+        let (known, missing) = cached_names(generation, vec![(0x10, 0x10), (0x20, 0x1F)]);
+        assert!(missing.is_empty());
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].method, "User:Loop ()");
+
+        // A domain reload frees JIT code: nothing carries over.
+        let (known, missing) = cached_names(generation + 1, vec![(0x10, 0x10)]);
+        assert!(known.is_empty());
+        assert_eq!(missing, vec![(0x10, 0x10)]);
+    }
+
+    #[test]
     fn refuses_to_capture_the_calling_thread() {
         let tid = unsafe { GetCurrentThreadId() };
-        assert!(capture(tid, &CaptureRequest::default()).is_err());
+        assert!(capture(tid, &CaptureRequest::default(), 1).is_err());
     }
 
     #[test]

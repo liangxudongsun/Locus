@@ -4351,6 +4351,58 @@ print("E7W:" + marker);"#;
         }
     }
 
+    /// A synchronous endless loop holds the main thread, so its own cancel
+    /// request can never be dequeued. The broker records the cancel natively,
+    /// the execution monitor arms the snippet's loop guard and the loop must
+    /// leave well before the 30s no-output timeout; the editor must then
+    /// answer again.
+    async fn check_loop_cancellation(&mut self, project: &str) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let code = r#"long spins = 0; while (true) { spins++; }"#;
+        let started = Instant::now();
+        let (result, _) = tokio::join!(
+            unity_bridge::unity_execute_code_with_progress_cancellable(
+                project,
+                code,
+                rx,
+                |_snapshot| {},
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let _ = tx.send(true);
+            }
+        );
+        let elapsed = started.elapsed();
+        let alive = execute_capture(project, r#"print("E8L:alive");"#).await;
+        match (result, alive) {
+            (Err(error), Ok(output))
+                if error == unity_bridge::UNITY_EXECUTE_CANCELLED
+                    && output.contains("E8L:alive")
+                    && elapsed <= Duration::from_secs(15) =>
+            {
+                self.pass(
+                    "E8L loop-cancel",
+                    format!("endless main-thread loop cancelled in {}ms; editor answers again", elapsed.as_millis()),
+                );
+            }
+            (result, alive) => self.fail(
+                "E8L loop-cancel",
+                format!(
+                    "after {}ms: execute={} follow-up={}",
+                    elapsed.as_millis(),
+                    match result {
+                        Ok(output) => format!("ok '{}'", clip(&output, 80)),
+                        Err(error) => clip(&error, 160),
+                    },
+                    match alive {
+                        Ok(output) => format!("ok '{}'", clip(&output, 80)),
+                        Err(error) => clip(&error, 160),
+                    }
+                ),
+            ),
+        }
+    }
+
     /// Two frame-spanning executes compile/bootstrap under the operation lock,
     /// then overlap while awaiting Unity and keep request-scoped output.
     async fn check_concurrency(&mut self, project: &str) {
@@ -7622,6 +7674,7 @@ async fn run_execute_suite(
     run.check_thread_and_tick_discovery(project).await;
     run.check_pending_await_diagnostics(project).await;
     run.check_cancellation(project).await;
+    run.check_loop_cancellation(project).await;
     run.check_concurrency(project).await;
     run.check_player_loop_debugger(project).await;
     if run_cancelled(cancel_rx) {

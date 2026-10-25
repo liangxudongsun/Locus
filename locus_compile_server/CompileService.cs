@@ -3009,7 +3009,8 @@ namespace System.Runtime.CompilerServices
             UnitySnippetSource.SourcePath,
             request.Params,
             request.ReferenceSessionImages,
-            request.NonPublicAccessProbeMode);
+            request.NonPublicAccessProbeMode,
+            loopGuardHostType: UnitySnippetSource.HostTypeName);
 
         return (bytes, bytes != null ? assemblyName : null, error);
     }
@@ -3045,7 +3046,8 @@ namespace System.Runtime.CompilerServices
         string sourcePath,
         CompileParamsDto? compileParams,
         bool referenceSessionImages,
-        string? nonPublicAccessProbeMode = null)
+        string? nonPublicAccessProbeMode = null,
+        string? loopGuardHostType = null)
     {
         CSharpParseOptions parseOptions = ResolveParseOptions(compileParams);
 
@@ -3057,6 +3059,10 @@ namespace System.Runtime.CompilerServices
                 parseOptions,
                 path: sourcePath,
                 encoding: Utf8NoBom);
+            // Agent snippets: make every loop cancellable (same rewrite as
+            // the in-Unity compile path; see LocusSnippetLoopGuard).
+            if (loopGuardHostType != null)
+                syntaxTree = global::Locus.LocusSnippetLoopGuard.Apply(syntaxTree, loopGuardHostType);
         }
         catch (Exception ex)
         {
