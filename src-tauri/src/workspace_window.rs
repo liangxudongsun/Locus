@@ -108,7 +108,7 @@ pub fn build_workspace_window(
         .windows
         .get(label)
     {
-        crate::work_state::apply_geometry(&window, record)?;
+        crate::work_state::apply_hidden_geometry(&window, record)?;
     }
     Ok(())
 }

@@ -12,7 +12,7 @@ import {
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import { waitForSharedWorkbenchTransferTarget } from "./sharedWorkbenchTransfer";
 import { invoke } from "@tauri-apps/api/core";
-import { ensureWorkWindow, restoredAuxWindows, shouldImportLegacyAuxWindows, scheduleWorkStateCapture } from "./workState";
+import { ensureWorkWindow, restoredAuxWindows, shouldImportLegacyAuxWindows, scheduleWorkStateCaptureForEvent } from "./workState";
 
 const SHARED_WINDOW_FRAGMENT_PREFIX = "locus-shared-workbench-";
 const SHARED_POOL_LABEL_PREFIX = "workbench-shared-pool-";
@@ -327,7 +327,7 @@ function addSharedHost(options: {
   });
   sharedWorkbenchWindowHosts.push(host);
   for (const type of ["input", "change", "pointerup", "scroll", "focusout"]) {
-    host.browserWindow.document.addEventListener(type, scheduleWorkStateCapture, { capture: true, passive: true });
+    host.browserWindow.document.addEventListener(type, scheduleWorkStateCaptureForEvent, { capture: true, passive: true });
   }
   publishSharedWindowDebugState();
   const handleUnload = () => void removeSharedWorkbenchWindowHost(host.label, false);

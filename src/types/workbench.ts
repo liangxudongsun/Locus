@@ -271,8 +271,10 @@ export type WorkbenchEditorTransferSnapshot =
   | { kind: "view"; state: Record<string, unknown> }
   | { kind: "agent"; selection: unknown; drafts: import("../components/agent/AgentDocumentEditor.vue").SavedAgentDocumentDraft[] }
   | { kind: "knowledge"; documentId: string;
-      session: import("../components/knowledge/knowledgeEditorWorkspaceSession").SavedKnowledgeDocumentSession;
-      selection?: { anchor: number; head: number } | null; scrollTop?: number }
+      /** Present only while the document has unsaved edits or conflicts. */
+      session?: import("../components/knowledge/knowledgeEditorWorkspaceSession").SavedKnowledgeDocumentSession;
+      selection?: { anchor: number; head: number } | null; scrollTop?: number;
+      scrollAnchor?: import("../document/readingAnchor").ReadingAnchor | null }
   | {
       kind: "session";
       composerDraft?: unknown;
@@ -283,22 +285,40 @@ export type WorkbenchEditorTransferSnapshot =
       kind: "workspaceFile";
       dirty?: boolean;
       conflicted?: boolean;
-      text: string;
+      /** Unsaved buffer. Omitted for clean files, which restore from disk. */
+      text?: string;
       contentHash: string;
       originalLineEnding: "\n" | "\r\n" | "\r";
       csv?: {
-        view: string;
-        viewBaseline: string;
+        /** Unsaved companion view. Omitted while the view matches its file. */
+        view?: string;
+        viewBaseline?: string;
         viewHash: string | null;
         mode: string;
         grid?: { row: number; column: number; endRow?: number; endColumn?: number; scrollTop: number; scrollLeft: number; zoom?: number };
       };
       selection?: { anchor: number; head: number } | null;
       scrollTop?: number | null;
+      scrollAnchor?: import("../document/readingAnchor").ReadingAnchor | null;
     }
   | {
       kind: "resource";
     };
+
+/**
+ * `workState` snapshots are saved continuously, so they omit buffers that
+ * already match the files on disk. Transfers between windows carry everything.
+ */
+export interface EditorSnapshotOptions {
+  workState?: boolean;
+}
+
+type WorkspaceFileTransferSnapshot = Extract<WorkbenchEditorTransferSnapshot, { kind: "workspaceFile" }>;
+/** A workspace file snapshot exported without `workState`: every buffer is present. */
+export type CompleteWorkspaceFileSnapshot = WorkspaceFileTransferSnapshot & {
+  text: string;
+  csv?: NonNullable<WorkspaceFileTransferSnapshot["csv"]> & { view: string; viewBaseline: string };
+};
 
 export interface WorkbenchEditorTransferRecord {
   version: 1;

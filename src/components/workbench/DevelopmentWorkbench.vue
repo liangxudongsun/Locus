@@ -7,7 +7,7 @@ import { registerFrontendWorkbench } from "../../services/frontendWorkbench";
 import { isSessionUnread, sessionAttention } from "../../services/sessionAttention";
 import WorktreeManager from "./WorktreeManager.vue";
 import WorkbenchEditorStack from "./WorkbenchEditorStack.vue";
-import { resolveWorkbenchSessionAvailability } from "./workbenchSessionAvailability";
+import { resolveWorkbenchSession } from "./workbenchSessionAvailability";
 import { workbenchViewIconValue } from "./workbenchViewIcon";
 import { sessionTabWorkspaceLabels } from "./workbenchTabWorkspace";
 import type { ManagedWorktree } from "../../services/worktrees";
@@ -134,7 +134,7 @@ import { useProjectStore } from "../../stores/project";
 import { useUiStore } from "../../stores/ui";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import { isManagedWorktreeCheckout, projectEntryCheckout, workspaceMaterializationMatches } from "../../services/project";
-import { workspaceRefForEditorBinding, editorBindingMatchesRuntime } from "./editorWorkspaceScope";
+import { workspaceRefForEditorBinding, editorBindingMatchesRuntime, sessionEditorBinding } from "./editorWorkspaceScope";
 import { lastSessionWorktree, rememberSessionWorktree } from "./sessionWorktreePreference";
 import { resolveWorkbenchFileTarget } from "./workbenchFileTarget";
 import { useWorkspaceExplorerStore } from "../../stores/workspaceExplorer";
@@ -1123,7 +1123,8 @@ async function captureWorkbenchWorkState(): Promise<void> {
       if (pendingWorkStateEditors.has(editor.editorId)) continue;
       if (!sessionEditorRefs.has(editor.editorId) && !workspaceFileEditorRefs.has(editor.editorId)
         && !workbenchViewEditorRefs.has(editor.editorId) && !agentEditorRefs.has(editor.editorId)) continue;
-      const snapshot = await exportWorkbenchEditorTransferSnapshot(editor);
+      // Saved work state omits buffers that match their files on disk.
+      const snapshot = await exportWorkbenchEditorTransferSnapshot(editor, { workState: true });
       if (snapshot.kind !== "resource") snapshots[editor.editorId] = snapshot;
     }
   }
@@ -3215,7 +3216,7 @@ function setWorkspaceFileEditorRef(editorId: string, value: unknown): void {
     workspaceFileEditorRefs.set(editorId, value as InstanceType<typeof WorkspaceFilePreview>);
     void restoreEditorWorkState(editorId);
   } else {
-    const snapshot = workspaceFileEditorRefs.get(editorId)?.exportTransferSnapshot();
+    const snapshot = workspaceFileEditorRefs.get(editorId)?.exportTransferSnapshot({ workState: true });
     if (snapshot) rememberEditorWorkState(editorId, snapshot);
     workspaceFileEditorRefs.delete(editorId);
   }
@@ -3462,6 +3463,7 @@ async function openInspectorInWorkbench(payload: WorkbenchInspectorOpenPayload):
 
 async function exportWorkbenchEditorTransferSnapshot(
   editor: WorkbenchEditorInput,
+  options: { workState?: boolean } = {},
 ): Promise<WorkbenchEditorTransferSnapshot> {
   if (agentEditorRefs.has(editor.editorId)) return agentEditorRefs.get(editor.editorId)!.exportTransferSnapshot();
   if (editor.resource.kind === "view") {
@@ -3477,7 +3479,7 @@ async function exportWorkbenchEditorTransferSnapshot(
     || (editor.resource.kind === "asset" && isWorkbenchDocumentPath(editor.resource.path))
     || editor.resource.kind === "knowledge"
   ) {
-    return workspaceFileEditorRefs.get(editor.editorId)?.exportTransferSnapshot()
+    return workspaceFileEditorRefs.get(editor.editorId)?.exportTransferSnapshot(options)
       ?? { kind: "resource" };
   }
   return { kind: "resource" };
@@ -4647,6 +4649,7 @@ async function reconcileRestoredWorkbenchEditors(
       let available = !!project;
       let sourcePath = editor.sourcePath ?? null;
       let reason: string | null = project ? null : t("workbench.unavailable.project");
+      let session: SessionSummary | null = null;
 
       if (available) {
         switch (resource.kind) {
@@ -4661,11 +4664,12 @@ async function reconcileRestoredWorkbenchEditors(
             reason = available ? null : t("workbench.unavailable.removed");
             break;
           case "session":
-            available = await resolveWorkbenchSessionAvailability(
+            session = await resolveWorkbenchSession(
               resource.projectId,
               resource.sessionId,
               explorerStore.resources[resource.projectId]?.sessions,
             );
+            available = !!session;
             reason = available ? null : t("workbench.unavailable.session");
             break;
           case "knowledge":
@@ -4728,14 +4732,20 @@ async function reconcileRestoredWorkbenchEditors(
         available = false;
         reason = t("workspace.setup.knowledgeDisabled");
       }
-      if (editor.checkoutBinding && (!checkout || checkout.available === false || (checkout.runtime && !editorBindingMatchesRuntime(editor.checkoutBinding,checkout.runtime)))) {
+      // A session tab's binding follows the session's current assignment; with
+      // a separate session checkout the tab binding is the layout workspace.
+      const sessionCheckout = sessionEditorBinding(editor.sessionCheckout, session);
+      const checkoutBinding = editor.sessionCheckout
+        ? editor.checkoutBinding ?? null
+        : sessionEditorBinding(editor.checkoutBinding, session);
+      if (checkoutBinding && (!checkout || checkout.available === false || (checkout.runtime && !editorBindingMatchesRuntime(checkoutBinding,checkout.runtime)))) {
         available=false; reason=t("workbench.unavailable.checkout");
       }
-      const sessionTarget = editor.sessionCheckout
-        ? workspaceContextStore.checkoutsById[editor.sessionCheckout.checkoutId]
+      const sessionTarget = sessionCheckout
+        ? workspaceContextStore.checkoutsById[sessionCheckout.checkoutId]
         : null;
-      if (resource.kind === "session" && editor.sessionCheckout && sessionTarget && (sessionTarget.available === false
-        || (sessionTarget.runtime && !editorBindingMatchesRuntime(editor.sessionCheckout, sessionTarget.runtime)))) {
+      if (resource.kind === "session" && sessionCheckout && sessionTarget && (sessionTarget.available === false
+        || (sessionTarget.runtime && !editorBindingMatchesRuntime(sessionCheckout, sessionTarget.runtime)))) {
         available = false; reason = t("workbench.unavailable.checkout");
       }
       if (
@@ -4754,9 +4764,10 @@ async function reconcileRestoredWorkbenchEditors(
           ? {
               checkoutId,
               expectedGeneration: checkout?.runtime?.workspaceGeneration ?? null,
-              expectedMaterializationEpoch: editor.checkoutBinding?.expectedMaterializationEpoch,
+              expectedMaterializationEpoch: checkoutBinding?.expectedMaterializationEpoch,
             }
           : null,
+        ...(sessionCheckout !== (editor.sessionCheckout ?? null) ? { sessionCheckout } : {}),
       });
     }
   }
@@ -5760,7 +5771,12 @@ function treeFileTimeTarget(item: DevelopmentTreeItem): WorkspaceFileTimeTarget 
 const treeFileTimes = useWorkspaceFileModifiedTimes(() => props.showExplorer && !props.prewarm
   ? treeItems.value.slice(treeVisibleRange.value.start, treeVisibleRange.value.end + 1)
     .flatMap((item) => { const target = treeFileTimeTarget(item); return target ? [target] : []; })
-  : [], () => treeTimeNow.value, ownerWindow);
+  : [], () => treeTimeNow.value, ownerWindow,
+// The tree shows the materialized checkouts of every visible project.
+() => props.showExplorer && !props.prewarm
+  ? visibleProjects.value.flatMap((project) => project.checkouts
+    .filter((checkout) => checkout.runtime).map(checkoutWorkspaceRef))
+  : []);
 
 const sessionPromotionRequests = new Set<string>();
 watch([

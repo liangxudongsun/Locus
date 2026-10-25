@@ -39,7 +39,7 @@ import { WORKBENCH_FILE_OPEN_KEY, openWorkbenchFileTab } from "../services/workb
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "../stores/notification";
 import type { KnowledgeWorkbenchPage } from "../types/workbench";
-import type { WorkbenchEditorTransferSnapshot } from "../types/workbench";
+import type { EditorSnapshotOptions, WorkbenchEditorTransferSnapshot } from "../types/workbench";
 import type { ToolFilePreviewHighlight } from "../services/toolFilePreviewWindow";
 
 const csvPreview = ref<InstanceType<typeof WorkspaceCsvEditor> | null>(null);
@@ -50,8 +50,8 @@ defineExpose({
   discardChanges: () => csvPreview.value?.discardChanges(),
   refreshIfChanged: async () => { await csvPreview.value?.refreshIfChanged(); },
   revealToolFileHighlight: async (highlight?: ToolFilePreviewHighlight) => await csvPreview.value?.revealToolFileHighlight(highlight) ?? false,
-  exportTransferSnapshot: (): WorkbenchEditorTransferSnapshot => csvPreview.value?.exportTransferSnapshot()
-    ?? documentPreview.value?.exportTransferSnapshot() ?? { kind: "resource" },
+  exportTransferSnapshot: (options?: EditorSnapshotOptions): WorkbenchEditorTransferSnapshot => csvPreview.value?.exportTransferSnapshot(options ?? {})
+    ?? documentPreview.value?.exportTransferSnapshot(options) ?? { kind: "resource" },
   applyTransferSnapshot: async (snapshot: WorkbenchEditorTransferSnapshot) => snapshot.kind === "knowledge"
     ? await documentPreview.value?.restoreWorkState(snapshot) ?? false : await csvPreview.value?.applyTransferSnapshot(snapshot) ?? false,
   restoreWorkState: async (snapshot: WorkbenchEditorTransferSnapshot) => snapshot.kind === "knowledge"

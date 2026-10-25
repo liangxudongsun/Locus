@@ -113,8 +113,10 @@ async function revealWorkbenchWindow(
     return;
   }
   registerWorkbenchAuxWindow(windowId);
-  if (props.sharedHost) await revealWorkStateWindow(windowId);
-  else await appWindow.show();
+  if (props.sharedHost) {
+    await revealWorkStateWindow(windowId);
+    isMaximized.value = await appWindow.isMaximized().catch(() => isMaximized.value);
+  } else await appWindow.show();
   windowRevealed = true;
   recordWorkbenchWindowMetric(props.sharedHost ? "shared-window-shown" : "window-shown", {
     token,
@@ -248,7 +250,9 @@ onMounted(async () => {
     unlistenResized = await appWindow.onResized(scheduleBoundsPersist);
     isMaximized.value = await appWindow.isMaximized().catch(() => false);
     alwaysOnTop.value = await appWindow.isAlwaysOnTop().catch(() => false);
-    if (restoring && getWorkbenchAuxWindowRecord(windowId)?.maximized) {
+    // Shared hosts are revealed maximized by `show_work_state_window`; maximizing
+    // the hidden window here would briefly show it on Windows.
+    if (!props.sharedHost && restoring && getWorkbenchAuxWindowRecord(windowId)?.maximized) {
       await appWindow.maximize().catch(() => undefined);
       isMaximized.value = await appWindow.isMaximized().catch(() => true);
     }

@@ -751,15 +751,17 @@ export const useWorkbenchStore = defineStore("workbench", () => {
       );
       return;
     }
+    const serializable = serializableWindow(state);
+    const key = storageKey(windowId, scopeId);
+    const json = JSON.stringify(serializable);
+    // Every work-state capture persists the layout; write only real changes.
+    // Other writers (hydration, repair) share the key, so compare with storage.
     try {
-      window.localStorage.setItem(
-        storageKey(windowId, scopeId),
-        JSON.stringify(serializableWindow(state)),
-      );
+      if (window.localStorage.getItem(key) !== json) window.localStorage.setItem(key, json);
     } catch (error) {
       console.warn("[workbench] layout persistence failed", error);
     }
-    recordWorkbenchLayout(windowId, scopeId, serializableWindow(state));
+    recordWorkbenchLayout(windowId, scopeId, serializable);
   }
 
   function ensureWindow(windowId = "main"): WorkbenchWindowState {

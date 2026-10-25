@@ -12,7 +12,7 @@ import type { WorkspaceRef } from "../../services/project";
 import { projectExplorerPreviewFile, projectExplorerWriteFile, workspaceFilePreview, workspaceFileWrite,
   projectExplorerFileRevision, workspaceFileRevision } from "../../services/workspaceExplorer";
 import { readCsvViewFile, writeCsvViewFile, relocateCsvFile, type CsvViewFile } from "../../services/csvDocument";
-import type { ProjectExplorerFilePreview, ProjectExplorerFileRevision, WorkbenchEditorTransferSnapshot } from "../../types/workbench";
+import type { CompleteWorkspaceFileSnapshot, EditorSnapshotOptions, ProjectExplorerFilePreview, ProjectExplorerFileRevision, WorkbenchEditorTransferSnapshot } from "../../types/workbench";
 import { applyCsvCellEdits, changeCsvColumn, deleteCsvRows, insertCsvRow, parseCsvDocument, serializeCsvDocument,
   type CsvCellEdit, type CsvDocument } from "../../document/csv/csvDocument";
 import { defaultCsvView, parseCsvView, reconcileCsvView, serializeCsvView, type CsvView } from "../../document/csv/csvView";
@@ -537,9 +537,15 @@ async function findNext(replaceAll = false): Promise<void> {
   selection.value = next;
   await grid.value?.applySnapshot({ ...next, scrollTop: Math.max(0, (next.row - view.value.headerRows) * view.value.rowHeight), scrollLeft: 0 });
 }
-function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
-  return { kind: "workspaceFile", dirty: dirty.value, conflicted: diskChanged.value, text: session.draft.value, contentHash: session.document.value?.contentHash ?? "",
-    originalLineEnding: "\n", csv: { view: viewText.value, viewBaseline: viewBaseline.value,
+function exportTransferSnapshot(): CompleteWorkspaceFileSnapshot;
+function exportTransferSnapshot(options: EditorSnapshotOptions): WorkbenchEditorTransferSnapshot;
+function exportTransferSnapshot(options: EditorSnapshotOptions = {}): WorkbenchEditorTransferSnapshot {
+  // Saved work state restores saved data and views from disk; unsaved buffers are kept.
+  const keepData = !options.workState || session.dirty.value || diskChanged.value;
+  const keepView = !options.workState || viewDirty.value;
+  return { kind: "workspaceFile", dirty: dirty.value, conflicted: diskChanged.value,
+    ...(keepData ? { text: session.draft.value } : {}), contentHash: session.document.value?.contentHash ?? "",
+    originalLineEnding: "\n", csv: { ...(keepView ? { view: viewText.value, viewBaseline: viewBaseline.value } : {}),
       viewHash: viewFile.value.contentHash ?? null, mode: mode.value, grid: grid.value?.getSnapshot() } };
 }
 async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot, recovering = false): Promise<boolean> {
@@ -547,15 +553,19 @@ async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot, 
   const deadline = Date.now() + 5000;
   while (session.loading.value && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 16));
   const changedOnDisk = snapshot.contentHash !== session.document.value?.contentHash;
-  if (changedOnDisk && !recovering) { diskChanged.value = true; return false; }
+  const text = snapshot.text;
+  // A snapshot without a buffer was saved; the loaded disk version is current.
+  if (changedOnDisk && !recovering && text !== undefined) { diskChanged.value = true; return false; }
   if ((recovering && snapshot.conflicted) || (changedOnDisk && snapshot.dirty)) diskChanged.value = true;
-  if (!changedOnDisk || snapshot.dirty) {
-    session.updateDraft(snapshot.text); session.modelDraft.value = snapshot.text;
+  if (text !== undefined && (!changedOnDisk || snapshot.dirty)) {
+    session.updateDraft(text); session.modelDraft.value = text;
   }
-  if (snapshot.csv && (!recovering || snapshot.csv.viewHash === (viewFile.value.contentHash ?? null))) {
-    view.value = parseCsvView(snapshot.csv.view); viewBaseline.value = snapshot.csv.viewBaseline;
+  const savedView = snapshot.csv?.view;
+  if (snapshot.csv && savedView !== undefined && (!recovering || snapshot.csv.viewHash === (viewFile.value.contentHash ?? null))) {
+    view.value = parseCsvView(savedView); viewBaseline.value = snapshot.csv.viewBaseline ?? savedView;
     viewFile.value = { contentHash: snapshot.csv.viewHash }; mode.value = snapshot.csv.mode;
   }
+  if (snapshot.csv && savedView === undefined) mode.value = snapshot.csv.mode;
   if (snapshot.csv && recovering) mode.value = snapshot.csv.mode;
   parseText(); remember();
   await nextTick();

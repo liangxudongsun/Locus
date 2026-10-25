@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { SavedWorkWindow } from "../services/workState";
+import type { SavedWorkWindow, WindowFrontendPatch } from "../services/workState";
 import type { WorkbenchWindowState } from "../types/workbench";
+import { applyTextDelta } from "../document/textDelta";
 
 const bridge = vi.hoisted(() => ({
   invoke: vi.fn(), label: "main", listeners: new Map<string, (event: { payload: string }) => void>(),
@@ -13,6 +14,28 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async (name, handler) =>
 vi.mock("../services/tauriRuntime", () => ({ hasTauriWindowRuntime: () => true, getCurrentTauriWindowLabel: () => bridge.label }));
 
 let windows: Record<string, SavedWorkWindow>;
+/** Mirrors `apply_frontend_patch` in src-tauri/src/work_state.rs. */
+function applyPatch(frontend: SavedWorkWindow["frontend"], patch: WindowFrontendPatch): SavedWorkWindow["frontend"] {
+  const next = (patch.replace ?? frontend ?? {}) as unknown as Record<string, unknown>;
+  Object.assign(next, patch.set);
+  for (const [field, changes] of Object.entries(patch.maps)) {
+    const map = (next[field] ??= {}) as Record<string, unknown>;
+    for (const [key, value] of Object.entries(changes ?? {})) {
+      if (value === null) { delete map[key]; continue; }
+      const { textDelta, ...entry } = value as Record<string, unknown> & {
+        textDelta?: { baseRevision: number; revision: number; from: number; to: number; insert: string };
+      };
+      if (textDelta) {
+        const previous = map[key] as { text: string; textRevision?: number };
+        if (previous.textRevision !== textDelta.baseRevision) throw new Error("text delta base mismatch");
+        entry.text = applyTextDelta(previous.text, textDelta);
+        entry.textRevision = textDelta.revision;
+      }
+      map[key] = entry;
+    }
+  }
+  return next as unknown as SavedWorkWindow["frontend"];
+}
 function record(label: string, ownerLabel = label): SavedWorkWindow {
   return { label, ownerLabel, visible: true, maximized: false, alwaysOnTop: false,
     frontend: { version: 1, layouts: {}, editors: {}, activeWorkspaceId: null } };
@@ -28,11 +51,11 @@ function layout(windowId: string): WorkbenchWindowState {
 beforeEach(() => {
   vi.resetModules(); vi.useFakeTimers(); localStorage.clear(); bridge.invoke.mockReset(); bridge.listeners.clear(); bridge.label = "main";
   windows = { main: record("main") };
-  bridge.invoke.mockImplementation(async (command: string, args?: { label: string; frontend: SavedWorkWindow["frontend"] }) => {
+  bridge.invoke.mockImplementation(async (command: string, args?: { label: string; patch: WindowFrontendPatch }) => {
     if (command === "load_desktop_work_state") return JSON.parse(JSON.stringify({ schemaVersion: 1, windows, legacyAuxImportPending: false }));
-    if (command === "save_window_work_state" && args) {
-      windows[args.label] ??= record(args.label, bridge.label);
-      windows[args.label]!.frontend = JSON.parse(JSON.stringify(args.frontend));
+    if (command === "save_window_work_state_patch" && args) {
+      windows[args.label] ??= { ...record(args.label, bridge.label), frontend: null };
+      windows[args.label]!.frontend = applyPatch(windows[args.label]!.frontend, JSON.parse(JSON.stringify(args.patch)));
     }
   });
 });
@@ -103,7 +126,7 @@ describe("durable desktop work state", () => {
     expect(Object.keys(windows)).toEqual(["main"]);
     expect(service.savedWindowState("workspace-app-a")).toBeNull();
     expect(service.restoredAuxWindows()).toEqual([]);
-    expect(bridge.invoke).not.toHaveBeenCalledWith("save_window_work_state", expect.objectContaining({ label: "workspace-app-a" }));
+    expect(bridge.invoke).not.toHaveBeenCalledWith("save_window_work_state_patch", expect.objectContaining({ label: "workspace-app-a" }));
     // Historical layouts remain available as cached data, not an open-window list.
     expect(localStorage.getItem("locus:workbench-window:workspace-app-a")).not.toBeNull();
   });
@@ -122,7 +145,7 @@ describe("durable desktop work state", () => {
     service.updateWindowWorkState("workbench-claimed", { activePage: "settings" });
     service.forgetWorkWindow("workbench-claimed");
     await service.flushWorkState();
-    expect(bridge.invoke).not.toHaveBeenCalledWith("save_window_work_state", expect.objectContaining({ label: "workbench-claimed" }));
+    expect(bridge.invoke).not.toHaveBeenCalledWith("save_window_work_state_patch", expect.objectContaining({ label: "workbench-claimed" }));
   });
 
   it("captures the final edit before acknowledging app exit and stops scheduling background writes", async () => {
@@ -134,9 +157,55 @@ describe("durable desktop work state", () => {
     await Promise.resolve();
     expect(service.isWorkStateExiting()).toBe(true);
     const calls = bridge.invoke.mock.calls.map(call => call[0]);
-    expect(calls.indexOf("save_window_work_state")).toBeLessThan(calls.indexOf("acknowledge_work_state_save"));
+    expect(calls.indexOf("save_window_work_state_patch")).toBeLessThan(calls.indexOf("acknowledge_work_state_save"));
     expect(windows.main!.frontend!.activePage).toBe("plugins");
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("sends only the changed editor entries and fields", async () => {
+    const service = await import("../services/workState");
+    await service.initializeWorkState("main");
+    const big = "x".repeat(100_000);
+    service.updateWindowWorkState("main", { editors: {
+      a: { kind: "workspaceFile", dirty: true, text: big, contentHash: "h", originalLineEnding: "\n", scrollTop: 1 },
+      b: { kind: "session" },
+    } });
+    await service.flushWorkState();
+    bridge.invoke.mockClear();
+    service.updateWindowWorkState("main", { editors: {
+      a: { kind: "workspaceFile", dirty: true, text: big, contentHash: "h", originalLineEnding: "\n", scrollTop: 2 },
+    }, activePage: "settings" });
+    await service.flushWorkState();
+    const patch = bridge.invoke.mock.calls.find(call => call[0] === "save_window_work_state_patch")![1].patch as WindowFrontendPatch;
+    expect(patch.set).toEqual({ activePage: "settings" });
+    expect(Object.keys(patch.maps.editors!)).toEqual(["b", "a"]);
+    expect(patch.maps.editors!.b).toBeNull();
+    // The backend already holds the unchanged 100 KB buffer.
+    expect(patch.maps.editors!.a).toEqual(expect.objectContaining({ scrollTop: 2, textDelta: expect.objectContaining({ insert: "" }) }));
+    expect(patch.maps.editors!.a).not.toHaveProperty("text");
+    expect(windows.main!.frontend!.editors).toEqual({ a: expect.objectContaining({ scrollTop: 2, text: big }) });
+    bridge.invoke.mockClear();
+    service.updateWindowWorkState("main", { editors: {
+      a: { kind: "workspaceFile", dirty: true, text: `${big}typed`, contentHash: "h", originalLineEnding: "\n", scrollTop: 2 },
+    } });
+    await service.flushWorkState();
+    const typed = bridge.invoke.mock.calls.find(call => call[0] === "save_window_work_state_patch")![1].patch as WindowFrontendPatch;
+    expect((typed.maps.editors!.a as { textDelta: { insert: string } }).textDelta.insert).toBe("typed");
+    expect((windows.main!.frontend!.editors.a as { text: string }).text).toBe(`${big}typed`);
+  });
+
+  it("waits longer after scrolling than after edits", async () => {
+    const service = await import("../services/workState");
+    await service.initializeWorkState("main");
+    await service.flushWorkState();
+    bridge.invoke.mockClear();
+    service.registerWorkStateProvider("main", () => service.updateWindowWorkState("main", { activePage: `p${Date.now()}` }));
+    document.dispatchEvent(new Event("scroll"));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(bridge.invoke).not.toHaveBeenCalled();
+    document.dispatchEvent(new Event("input"));
+    await vi.advanceTimersByTimeAsync(450);
+    expect(bridge.invoke).toHaveBeenCalledWith("save_window_work_state_patch", expect.anything());
   });
 
   it("does not continuously reschedule unchanged snapshots and retries a failed durable write", async () => {
