@@ -414,6 +414,22 @@ mod tests {
     }
 
     #[test]
+    fn picking_the_source_branch_keeps_the_source_checkout_epoch() {
+        let (_temp, source) = fixture();
+        let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(&source).unwrap();
+        assert!(record_for_root(&source).unwrap().is_none());
+        let current = git_text(&source, &["branch", "--show-current"]).unwrap();
+        let picked = select(&source, &current, false, false, 1).unwrap();
+        assert_eq!(picked.checkout_id, identity.checkout_id.to_string());
+        assert!(!picked.managed && !picked.pool_slot);
+        // Sessions and the open runtime were bound at the unjournaled epoch 0.
+        assert_eq!(picked.materialization_epoch, 0);
+        assert_eq!(record_for_root(&source).unwrap().unwrap().materialization_epoch, 0);
+        assert!(!crate::workspace_service::identity::ProjectIdResolver::resolve(&source).unwrap().managed_worktree);
+        assert_eq!(select(&source, &current, false, false, 1).unwrap().materialization_epoch, 0);
+    }
+
+    #[test]
     fn picker_reuses_released_pool_library_and_copies_dirty_source() {
         let (_temp, source) = fixture();
         let first = select(&source, "codex/picker-first", true, false, 1).unwrap();

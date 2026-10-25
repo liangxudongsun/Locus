@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { editorBindingMatchesRuntime, workspaceRefForEditorBinding } from "../components/workbench/editorWorkspaceScope";
+import { editorBindingMatchesRuntime, sessionEditorBinding, workspaceRefForEditorBinding } from "../components/workbench/editorWorkspaceScope";
 import { materializationEpochFromParams, workspaceMaterializationMatches, type WorkspaceRuntimeDescriptor } from "../services/project";
 import { buildExtraWorkdirsWindowQuery, getExtraWorkdirsWindowPayload } from "../services/extraWorkdirsWindow";
 
@@ -38,6 +38,27 @@ describe("durable editor assignment", () => {
     expect(workspaceRefForEditorBinding({ checkoutId: "slot" }, runtime(2, 9))).toEqual({
       checkoutId: "slot", expectedGeneration: undefined, expectedMaterializationEpoch: undefined,
     });
+  });
+
+  it("follows the session's durable assignment for session tabs", () => {
+    // Tab persisted before the session was adopted into the imported checkout.
+    const persisted = { checkoutId: "source", expectedGeneration: 1, expectedMaterializationEpoch: 0 };
+    const adopted = sessionEditorBinding(persisted, { defaultCheckoutId: "source", defaultMaterializationEpoch: 1 });
+    expect(adopted).toEqual({ ...persisted, expectedMaterializationEpoch: 1 });
+    expect(editorBindingMatchesRuntime(adopted, { ...runtime(1), checkoutId: "source" })).toBe(true);
+    expect(persisted.expectedMaterializationEpoch).toBe(0);
+
+    // A recycled slot keeps the session on its old epoch, so the tab stays stale.
+    const recycled = { checkoutId: "slot", expectedMaterializationEpoch: 1 };
+    const kept = sessionEditorBinding(recycled, { defaultCheckoutId: "slot", defaultMaterializationEpoch: 1 });
+    expect(kept).toBe(recycled);
+    expect(editorBindingMatchesRuntime(kept, runtime(2))).toBe(false);
+
+    // Another checkout or an unbound session never changes the tab binding.
+    expect(sessionEditorBinding(recycled, { defaultCheckoutId: "other", defaultMaterializationEpoch: 2 })).toBe(recycled);
+    expect(sessionEditorBinding(recycled, { defaultCheckoutId: "slot", defaultMaterializationEpoch: null })).toBe(recycled);
+    expect(sessionEditorBinding(recycled, null)).toBe(recycled);
+    expect(sessionEditorBinding(null, { defaultCheckoutId: "slot", defaultMaterializationEpoch: 2 })).toBeNull();
   });
 
   it("roundtrips epoch zero and reused epochs through detached window URLs", () => {

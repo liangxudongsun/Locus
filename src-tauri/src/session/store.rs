@@ -306,53 +306,152 @@ impl SessionEventWriter {
         }
     }
 
+    /// Merge consecutive deltas with the same key into the first one's payload.
+    ///
+    /// Each group's head payload is parsed once (only when a second delta
+    /// actually merges), deltas are appended to the parsed string in place,
+    /// and the payload is serialized once when the group closes. Re-parsing and
+    /// re-serializing per delta made a batch quadratic in its text: after one
+    /// large delta, every small delta behind it cost a full copy.
     fn coalesce_batch(batch: &[QueuedSessionEvent]) -> Vec<QueuedSessionEvent> {
+        struct OpenGroup {
+            key: String,
+            field: String,
+            /// Parsed head payload once a delta has merged; `None` until then.
+            payload: Option<serde_json::Value>,
+            /// The head payload cannot take merges (not JSON or no string field).
+            sealed: bool,
+        }
+
+        fn close(out: &mut [QueuedSessionEvent], group: Option<OpenGroup>) {
+            let (Some(payload), Some(head)) = (group.and_then(|group| group.payload), out.last_mut())
+            else {
+                return;
+            };
+            // A `Value` with string keys always serializes.
+            if let Ok(json) = serde_json::to_string(&payload) {
+                head.event.payload_json = json;
+            }
+        }
+
         let mut out: Vec<QueuedSessionEvent> = Vec::with_capacity(batch.len());
+        let mut open: Option<OpenGroup> = None;
 
         for item in batch {
-            if let Some(merge) = item.merge.as_ref() {
-                if let Some(last) = out.last_mut() {
-                    let same_key = last
-                        .merge
-                        .as_ref()
-                        .map(|last_merge| last_merge.key.as_str())
-                        == Some(merge.key.as_str());
-
-                    if same_key
-                        && Self::append_payload_field(
-                            &mut last.event.payload_json,
-                            &merge.field,
-                            &merge.value,
-                        )
+            if let (Some(merge), Some(group)) = (item.merge.as_ref(), open.as_mut()) {
+                if !group.sealed && group.key == merge.key && group.field == merge.field {
+                    if group.payload.is_none() {
+                        let head = &out.last().expect("an open group has a head").event.payload_json;
+                        group.payload = serde_json::from_str::<serde_json::Value>(head)
+                            .ok()
+                            .filter(|payload| payload.get(&group.field).is_some_and(|value| value.is_string()));
+                        group.sealed = group.payload.is_none();
+                    }
+                    if let Some(serde_json::Value::String(text)) =
+                        group.payload.as_mut().and_then(|payload| payload.get_mut(&merge.field))
                     {
-                        last.status_updates.extend(item.status_updates.clone());
+                        text.push_str(&merge.value);
+                        let head = out.last_mut().expect("an open group has a head");
+                        head.status_updates.extend(item.status_updates.iter().cloned());
                         continue;
                     }
                 }
             }
 
+            close(&mut out, open.take());
             out.push(item.clone());
+            open = item.merge.as_ref().map(|merge| OpenGroup {
+                key: merge.key.clone(),
+                field: merge.field.clone(),
+                payload: None,
+                sealed: false,
+            });
         }
+        close(&mut out, open.take());
 
         out
     }
+}
 
-    fn append_payload_field(payload_json: &mut String, field: &str, value: &str) -> bool {
-        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(payload_json) else {
-            return false;
-        };
-        let Some(existing) = payload.get(field).and_then(|value| value.as_str()) else {
-            return false;
-        };
-        let merged = format!("{}{}", existing, value);
-        payload[field] = serde_json::Value::String(merged);
-        match serde_json::to_string(&payload) {
-            Ok(next) => {
-                *payload_json = next;
-                true
-            }
-            Err(_) => false,
+#[cfg(test)]
+mod event_writer_coalesce_tests {
+    use super::{
+        QueuedSessionEvent, SessionEventAppend, SessionEventMerge, SessionEventWriter,
+        SessionRunStatusUpdate,
+    };
+    use std::time::{Duration, Instant};
+
+    fn delta(key: &str, text: &str) -> QueuedSessionEvent {
+        QueuedSessionEvent {
+            event: SessionEventAppend {
+                session_id: "session".into(),
+                run_id: "run".into(),
+                event_type: "textDelta".into(),
+                payload_json: serde_json::json!({"type": "textDelta", "sessionId": "session", "text": text})
+                    .to_string(),
+            },
+            merge: Some(SessionEventMerge {
+                key: key.into(),
+                field: "text".into(),
+                value: text.into(),
+            }),
+            status_updates: Vec::new(),
         }
+    }
+
+    fn text(item: &QueuedSessionEvent) -> String {
+        let payload: serde_json::Value = serde_json::from_str(&item.event.payload_json).unwrap();
+        payload["text"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn consecutive_deltas_merge_in_order_and_a_new_key_starts_a_new_row() {
+        let mut plain = delta("other", "x");
+        plain.merge = None;
+        let mut last = delta("a", "e");
+        last.status_updates.push(SessionRunStatusUpdate {
+            run_id: "run".into(),
+            status: "running".into(),
+            error_message: None,
+        });
+        let out = SessionEventWriter::coalesce_batch(&[
+            delta("a", "a"),
+            delta("a", "b"),
+            delta("b", "c"),
+            plain,
+            delta("a", "d"),
+            last,
+        ]);
+        assert_eq!(out.iter().map(text).collect::<Vec<_>>(), ["ab", "c", "x", "de"]);
+        assert_eq!(out[3].status_updates.len(), 1);
+        // A row without merges keeps its original payload bytes.
+        assert_eq!(out[1].event.payload_json, delta("b", "c").event.payload_json);
+    }
+
+    #[test]
+    fn an_unmergeable_head_keeps_its_followers_as_separate_rows() {
+        let mut head = delta("a", "a");
+        head.event.payload_json = "not json".into();
+        let out = SessionEventWriter::coalesce_batch(&[head, delta("a", "b"), delta("a", "c")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event.payload_json, "not json");
+        assert_eq!(text(&out[1]), "bc");
+    }
+
+    #[test]
+    fn small_deltas_behind_a_large_one_cost_linear_time() {
+        // The former per-delta parse and serialize copied the whole merged text
+        // for each of the 127 followers, which took seconds in debug builds.
+        let large = "y".repeat(4 * 1024 * 1024);
+        let mut batch = vec![delta("a", &large)];
+        batch.extend((0..127).map(|index| delta("a", &format!("|{index}|"))));
+        let started = Instant::now();
+        let out = SessionEventWriter::coalesce_batch(&batch);
+        let elapsed = started.elapsed();
+        assert_eq!(out.len(), 1);
+        let merged = text(&out[0]);
+        assert!(merged.starts_with(&large) && merged.ends_with("|125||126|"));
+        assert!(elapsed < Duration::from_secs(2), "coalescing took {elapsed:?}");
     }
 }
 
@@ -3506,6 +3605,25 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Imports used to journal an unmanaged checkout at epoch 1 while the
+    /// sessions bound before the import kept the unjournaled epoch 0, which
+    /// made them look reassigned. Locus never re-materializes an unmanaged
+    /// checkout, so both epochs name the same directory: rebind those
+    /// sessions. Only call this for an unmanaged checkout's journaled epoch.
+    /// Runs keep their immutable snapshots.
+    pub fn adopt_pre_import_session_bindings(&self, checkout_id: &str, epoch: u64) -> Result<usize, String> {
+        if epoch == 0 {
+            return Ok(0);
+        }
+        let epoch = i64::try_from(epoch).map_err(|_| "Materialization epoch exceeds SQLite range")?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE session_checkout_assignments SET materialization_epoch=?2 WHERE checkout_id=?1 AND materialization_epoch=0",
+            params![checkout_id, epoch],
+        )
+        .map_err(|e| format!("Failed to adopt pre-import session bindings: {e}"))
+    }
+
     pub fn get_session_workspace_scope(
         &self,
         session_id: &str,
@@ -5733,6 +5851,7 @@ impl SessionStore {
 
         Ok(SessionViewSnapshot {
             remote_sync_warning: None,
+            stream_revision: None,
             session: SessionDetail {
                 id: id.to_string(),
                 title,
@@ -9102,6 +9221,40 @@ mod tests {
         assert_eq!(store.get_run_scope("epoch-one").unwrap().unwrap().materialization_epoch, Some(1));
         assert_eq!(store.get_run_scope("epoch-two").unwrap().unwrap().materialization_epoch, Some(2));
         assert_eq!(store.list_persisted_session_runs(&session).unwrap()[0].materialization_epoch, Some(1));
+    }
+
+    #[test]
+    fn legacy_import_adopts_sessions_bound_before_the_checkout_was_journaled() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path()).unwrap();
+        for checkout in ["source", "other"] {
+            store.upsert_workspace_checkout(&WorkspaceCheckoutRecord {
+                checkout_id: checkout.into(), project_id: "project".into(), root_path: format!("missing-{checkout}"), normalized_root: format!("missing-{checkout}"), last_opened_at: 1,
+            }).unwrap();
+        }
+        // Bound while the source checkout had no journal record.
+        let before = store.create_session("Before import", None, Some("project"), "chat", None).unwrap();
+        store.bind_session_checkout(&before, "source", 0).unwrap();
+        let after = store.create_session("After import", None, Some("project"), "chat", None).unwrap();
+        store.bind_session_checkout(&after, "source", 1).unwrap();
+        let elsewhere = store.create_session("Other checkout", None, Some("project"), "chat", None).unwrap();
+        store.bind_session_checkout(&elsewhere, "other", 0).unwrap();
+        let scope = SessionRunScopeSnapshot { project_id: "project".into(), checkout_id: "source".into(), workspace_generation: 1, materialization_epoch: Some(0), branch_ref: Some("refs/heads/master".into()), head_oid: Some("abc".into()), service_bindings: Vec::new() };
+        store.try_start_run_scoped(&before, "before-run", Some(&scope)).unwrap();
+        store.update_run_status("before-run", RUN_STATUS_DONE, None).unwrap();
+        // The legacy import journaled the same directory at epoch 1.
+        assert!(store.validate_session_materialization(&before, "source", 1).is_err());
+
+        assert_eq!(store.adopt_pre_import_session_bindings("source", 1).unwrap(), 1);
+        assert!(store.validate_session_materialization(&before, "source", 1).is_ok());
+        assert_eq!(store.load_session(&before).unwrap().default_materialization_epoch, Some(1));
+        assert_eq!(store.session_materialization_epoch(&after).unwrap(), Some(("source".into(), 1)));
+        assert_eq!(store.session_materialization_epoch(&elsewhere).unwrap(), Some(("other".into(), 0)));
+        assert_eq!(store.get_run_scope("before-run").unwrap().unwrap().materialization_epoch, Some(0));
+        // Idempotent, and a checkout still at epoch 0 is left untouched.
+        assert_eq!(store.adopt_pre_import_session_bindings("source", 1).unwrap(), 0);
+        assert_eq!(store.adopt_pre_import_session_bindings("other", 0).unwrap(), 0);
+        assert_eq!(store.session_materialization_epoch(&elsewhere).unwrap(), Some(("other".into(), 0)));
     }
 
     fn table_exists(conn: &Connection, table: &str) -> bool {

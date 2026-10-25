@@ -836,6 +836,10 @@ pub fn import(source_root: &Path, target_root: &Path) -> Result<ManagedWorktree,
         }
         return Ok(record.clone());
     }
+    // Importing only journals a directory Locus did not materialize and never
+    // recycles, so it keeps the epoch an unjournaled checkout reports (0).
+    // Sessions, pane contexts and an already open runtime (the source
+    // checkout, when the picker selects its branch) stay bound to it.
     let record = ManagedWorktree {
         checkout_id,
         project_id: source_id.project_id.to_string(),
@@ -844,7 +848,7 @@ pub fn import(source_root: &Path, target_root: &Path) -> Result<ManagedWorktree,
         project_relative_path: relative,
         branch: git_text(&repo, &["symbolic-ref", "-q", "HEAD"]).ok(),
         head_oid: git_text(&repo, &["rev-parse", "HEAD"])?,
-        materialization_epoch: 1,
+        materialization_epoch: 0,
         managed: false,
         lifecycle: "active".into(),
         dirty: !git(
@@ -1414,7 +1418,13 @@ pub(crate) mod tests {
         .unwrap();
         let imported = import(&repo, &external).unwrap();
         assert!(!imported.managed);
-        assert!(remove(&repo, &imported.checkout_id, 1)
+        // The directory keeps the epoch it had before it was journaled.
+        assert_eq!(imported.materialization_epoch, 0);
+        assert_eq!(
+            record_for_root(&external).unwrap().unwrap().materialization_epoch,
+            0
+        );
+        assert!(remove(&repo, &imported.checkout_id, imported.materialization_epoch)
             .unwrap_err()
             .contains("ownership"));
     }
