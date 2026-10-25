@@ -1,12 +1,12 @@
 {
-  "version": "0.9.1",
-  "releasedAt": "2026-10-21",
+  "version": "0.9.2",
+  "releasedAt": "2026-10-25",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,50 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.9.1 (2026-10-21)",
+      "summary": "Locus v0.9.2 (2026-10-25)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.9.2（新增）",
+          "items": [
+            "Markdown 文档支持批注。选中文字后，从右键菜单或按 Ctrl+Alt+M 添加批注。批注可以回复、编辑、解决和重新打开，显示在知识文档和文件预览的右侧边栏。批注保存在 Markdown 文件末尾的隐藏块中，其他 Markdown 渲染器不会显示。可以在“设置 > 通用”中设置批注署名。",
+            "Markdown 文档支持脚注（`[^label]`）。从右键菜单或按 Ctrl+Alt+F 插入，引用显示为带编号的上标，点击即可查看和编辑脚注内容。",
+            "重新打开 Markdown 文档时，会回到上次阅读的位置。知识文档重命名或移动后仍保留位置，同一项目的各个 worktree 共用阅读位置。",
+            "文件资源管理器可以重命名工作区文件夹。Unity `.meta` 文件、知识条目、布局引用和文件排序会随文件夹一起更新。",
+            "停止 `unity_execute` 时，占住 Unity 主线程的循环也会停止：代码片段中的循环会在下一次迭代时退出，死循环不再需要重启 Editor。更新时已经打开的 Editor 需要重启一次，才能加载新的原生插件。",
+            "Python SDK 新增 `cancel_unity_execution(...)`，可以停止后台运行的 Unity 执行，即使它正占住主线程。",
+            "Unity 主线程持续无响应时，卡死诊断会持续采样。状态面板和 Agent 报告会显示持续时长、正在运行的是 Unity 自身、项目代码还是 Agent 代码、是否像死锁或死循环，以及一直没有返回的调用。"
+          ]
+        },
+        {
+          "title": "v0.9.2（修复）",
+          "items": [
+            "Unity 正在编译、导入或运行初始化代码时，重编译会继续等待，最多容忍 3 分钟无响应；主线程繁忙时也能读取重编译结果。如果卡死诊断显示 Editor 无法自行恢复，重编译会报告卡住的位置。",
+            "已有其他重编译在进行时，Locus 会等它完成后再编译一次，确保加载的是当前源码。得到“无需重编译”的结果后，会等待 Unity 紧接着开始的编译或导入完成。",
+            "Unity 主线程繁忙导致客户端的进度检查延迟时，长时间运行的 `unity_execute` 不再被当作客户端断开而取消。后台运行卡住时，提示信息会说明如何取消或稍后读取结果。",
+            "切换到仍在回复的会话时，加载期间流式输出的文字不再丢失或重复。",
+            "打开多个窗口时，流式回复和文件变化只发送给显示该会话或工作区的窗口。",
+            "大量文件变化会合并处理。文件夹被重新扫描、删除或重命名后，资源管理器、差异预览、文件时间和 Markdown 图片会刷新其下的全部内容。",
+            "聊天和预览中渲染的 Markdown 只在其引用的文件变化时刷新，并按它所属的工作区解析路径。",
+            "窗口状态改为按增量保存。大文件的未保存修改只保存改动部分；没有未保存修改的文件不再复制到保存的状态中，恢复时从磁盘读取。",
+            "恢复最大化的窗口时，不再先以普通大小闪现。在后台打开的窗口不再抢占焦点，弹出窗口可以接收拖入的文件。",
+            "同时打开多个窗口时，不再多创建一个始终不可用的弹出窗口。",
+            "文档草稿恢复数据改为以增量形式保存在 Locus 数据目录中，打开未修改的文档不会写入任何内容。已有草稿会自动迁移。",
+            "在 worktree 选择器中选中工作区的当前分支后，该工作区的会话不再显示为已移到其他检出。受影响的会话会在启动时重新关联，会话标签页跟随会话所属的工作区。",
+            "修复了 Claude Code CLI 路径的一些问题。",
+            "以命名空间形式返回 `tool_search` 的 Codex 模型（Responses Lite）可以正常加载延迟工具。",
+            "资产文本查看器可以显示完整的源文件（最多 20,000 行或 2 MB）。更大文件的截断提示显示在代码末尾。",
+            "从之前仅含工具调用的消息合并进来的工具调用，会显示在回复的思考和正文之前；知识提议仍显示在最后。",
+            "保存很长的流式回复时，速度不再随回复变长而下降。",
+            "在 Markdown 编辑器中把整行选区缩小到行内一部分时，选中的文字不再被重复绘制。"
+          ]
+        },
+        {
+          "title": "v0.9.2（移除）",
+          "items": [
+            "本版本没有移除面向用户的工作流或兼容路径。"
+          ]
+        },
         {
           "title": "v0.9.1（新增）",
           "items": [
@@ -631,11 +672,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -645,9 +686,50 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.9.1 (2026-10-21)",
+      "summary": "Locus v0.9.2 (2026-10-25)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.9.2 (Added)",
+          "items": [
+            "Markdown documents support comments. Select text and add a comment from the context menu or with Ctrl+Alt+M. Comments can be replied to, edited, resolved, and reopened, and appear in the right margin of knowledge documents and file previews. They are stored in a hidden block at the end of the Markdown file, so other Markdown renderers do not show them. Set the name shown on your comments in Settings > General.",
+            "Markdown documents support footnotes (`[^label]`). Insert one from the context menu or with Ctrl+Alt+F. References show as numbered superscripts; click one to view and edit the note.",
+            "Markdown documents reopen where you stopped reading. Knowledge documents keep their position after renames and moves, and worktrees of the same project share it.",
+            "Workspace folders can be renamed in the file explorer. Unity `.meta` files, knowledge entries, layout references, and file order move with the folder.",
+            "Stopping a `unity_execute` run also stops loops that hold the Unity main thread: loops in the snippet exit at their next iteration, so an endless loop no longer requires restarting the Editor. An Editor that was open during the update needs one restart to load the new native plugin.",
+            "Python SDK: new `cancel_unity_execution(...)` stops a detached Unity execution, even while it holds the main thread.",
+            "While Unity's main thread stays unresponsive, the hang diagnosis keeps sampling. The status panel and Agent reports show how long it has lasted, whether Unity, project code, or Agent code is running, whether it looks like a deadlock or an endless loop, and the call that has not returned."
+          ]
+        },
+        {
+          "title": "v0.9.2 (Fixed)",
+          "items": [
+            "Unity recompiles keep waiting while Unity is compiling, importing, or running initializers, for up to 3 minutes without response, and recompile results can be read while the main thread is busy. If the hang diagnosis shows the Editor will not recover, the recompile reports where it is stuck.",
+            "If another recompile is already running, Locus waits for it and then compiles again so the current sources are loaded. After a \"no recompile needed\" result, it waits for any compile or import Unity starts right after.",
+            "A long `unity_execute` run is no longer cancelled as a lost client when Unity's busy main thread delayed the client's progress checks. When a detached run stalls, the message explains how to cancel it or read its result later.",
+            "Switching to a session that is still replying no longer loses or repeats text streamed while the session loads.",
+            "With several windows open, streamed replies and file changes are sent only to windows that show that session or workspace.",
+            "Bursts of file changes are batched. After a folder is rescanned, deleted, or renamed, the explorer, diff previews, file times, and Markdown images refresh everything below it.",
+            "Rendered Markdown in chat and previews refreshes only when a file it references changes, and resolves paths against its own workspace.",
+            "Window state is saved as small incremental changes. Unsaved edits to large files save only the changed part, and files without unsaved changes are no longer copied into the saved state; they reload from disk.",
+            "Restoring a maximized window no longer shows it at its normal size first. Windows opened in the background no longer take focus, and pop-up windows accept dragged files.",
+            "Opening several windows at once no longer creates an extra pop-up window that never becomes available.",
+            "Document draft recovery is stored in the Locus data directory as incremental changes, and opening an unchanged document writes nothing. Existing drafts are migrated automatically.",
+            "Sessions in a workspace whose current branch was picked in the worktree picker no longer appear moved to another checkout. Affected sessions are reattached at startup, and session tabs follow their session's workspace.",
+            "Fixed several issues in the Claude Code CLI path.",
+            "Codex models that return `tool_search` as a namespaced call (Responses Lite) can load deferred tools.",
+            "The asset text viewer shows whole source files (up to 20,000 lines or 2 MB). For larger files, the truncation notice appears at the end of the code.",
+            "Tool calls merged into a reply from earlier tool-only rows appear before its thinking and text; knowledge proposals stay at the end.",
+            "Saving long streamed replies no longer slows down as the reply grows.",
+            "In the Markdown editor, shrinking a full-line selection to part of a line no longer paints the selected text twice."
+          ]
+        },
+        {
+          "title": "v0.9.2 (Removed)",
+          "items": [
+            "No user-facing workflows or compatibility paths were removed."
+          ]
+        },
         {
           "title": "v0.9.1 (Added)",
           "items": [
@@ -1247,11 +1329,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

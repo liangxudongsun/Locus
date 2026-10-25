@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.9.1 (2026-10-21)"
+description: "Locus v0.9.2 (2026-10-25)"
 sidebarTitle: "当前版本"
-version: "0.9.1"
-releasedAt: "2026-10-21"
+version: "0.9.2"
+releasedAt: "2026-10-25"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,46 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.9.1/locus_0.9.1_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.9.2（新增）
+
+- Markdown 文档支持批注。选中文字后，从右键菜单或按 Ctrl+Alt+M 添加批注。批注可以回复、编辑、解决和重新打开，显示在知识文档和文件预览的右侧边栏。批注保存在 Markdown 文件末尾的隐藏块中，其他 Markdown 渲染器不会显示。可以在“设置 > 通用”中设置批注署名。
+- Markdown 文档支持脚注（`[^label]`）。从右键菜单或按 Ctrl+Alt+F 插入，引用显示为带编号的上标，点击即可查看和编辑脚注内容。
+- 重新打开 Markdown 文档时，会回到上次阅读的位置。知识文档重命名或移动后仍保留位置，同一项目的各个 worktree 共用阅读位置。
+- 文件资源管理器可以重命名工作区文件夹。Unity `.meta` 文件、知识条目、布局引用和文件排序会随文件夹一起更新。
+- 停止 `unity_execute` 时，占住 Unity 主线程的循环也会停止：代码片段中的循环会在下一次迭代时退出，死循环不再需要重启 Editor。更新时已经打开的 Editor 需要重启一次，才能加载新的原生插件。
+- Python SDK 新增 `cancel_unity_execution(...)`，可以停止后台运行的 Unity 执行，即使它正占住主线程。
+- Unity 主线程持续无响应时，卡死诊断会持续采样。状态面板和 Agent 报告会显示持续时长、正在运行的是 Unity 自身、项目代码还是 Agent 代码、是否像死锁或死循环，以及一直没有返回的调用。
+
+### v0.9.2（修复）
+
+- Unity 正在编译、导入或运行初始化代码时，重编译会继续等待，最多容忍 3 分钟无响应；主线程繁忙时也能读取重编译结果。如果卡死诊断显示 Editor 无法自行恢复，重编译会报告卡住的位置。
+- 已有其他重编译在进行时，Locus 会等它完成后再编译一次，确保加载的是当前源码。得到“无需重编译”的结果后，会等待 Unity 紧接着开始的编译或导入完成。
+- Unity 主线程繁忙导致客户端的进度检查延迟时，长时间运行的 `unity_execute` 不再被当作客户端断开而取消。后台运行卡住时，提示信息会说明如何取消或稍后读取结果。
+- 切换到仍在回复的会话时，加载期间流式输出的文字不再丢失或重复。
+- 打开多个窗口时，流式回复和文件变化只发送给显示该会话或工作区的窗口。
+- 大量文件变化会合并处理。文件夹被重新扫描、删除或重命名后，资源管理器、差异预览、文件时间和 Markdown 图片会刷新其下的全部内容。
+- 聊天和预览中渲染的 Markdown 只在其引用的文件变化时刷新，并按它所属的工作区解析路径。
+- 窗口状态改为按增量保存。大文件的未保存修改只保存改动部分；没有未保存修改的文件不再复制到保存的状态中，恢复时从磁盘读取。
+- 恢复最大化的窗口时，不再先以普通大小闪现。在后台打开的窗口不再抢占焦点，弹出窗口可以接收拖入的文件。
+- 同时打开多个窗口时，不再多创建一个始终不可用的弹出窗口。
+- 文档草稿恢复数据改为以增量形式保存在 Locus 数据目录中，打开未修改的文档不会写入任何内容。已有草稿会自动迁移。
+- 在 worktree 选择器中选中工作区的当前分支后，该工作区的会话不再显示为已移到其他检出。受影响的会话会在启动时重新关联，会话标签页跟随会话所属的工作区。
+- 修复了 Claude Code CLI 路径的一些问题。
+- 以命名空间形式返回 `tool_search` 的 Codex 模型（Responses Lite）可以正常加载延迟工具。
+- 资产文本查看器可以显示完整的源文件（最多 20,000 行或 2 MB）。更大文件的截断提示显示在代码末尾。
+- 从之前仅含工具调用的消息合并进来的工具调用，会显示在回复的思考和正文之前；知识提议仍显示在最后。
+- 保存很长的流式回复时，速度不再随回复变长而下降。
+- 在 Markdown 编辑器中把整行选区缩小到行内一部分时，选中的文字不再被重复绘制。
+
+### v0.9.2（移除）
+
+- 本版本没有移除面向用户的工作流或兼容路径。
 
 ### v0.9.1（新增）
 
