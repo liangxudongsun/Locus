@@ -33,7 +33,7 @@
     },
     {
       "path": "src/services/viewDocuments.ts",
-      "bytes": 10913
+      "bytes": 10951
     },
     {
       "path": "src/document/markdownProperties.ts",
@@ -61,7 +61,7 @@
     },
     {
       "path": "src/components/view/viewHostApi.ts",
-      "bytes": 20318
+      "bytes": 20516
     },
     {
       "path": "src/components/view/viewAutomation.ts",
@@ -101,7 +101,15 @@
     },
     {
       "path": "src/services/workspaceEventHub.ts",
-      "bytes": 8137
+      "bytes": 10359
+    },
+    {
+      "path": "src/services/windowEventInterests.ts",
+      "bytes": 8222
+    },
+    {
+      "path": "src/services/windowEventTransport.ts",
+      "bytes": 870
     },
     {
       "path": "src/components/view/viewRuntime.ts",
@@ -201,7 +209,7 @@
     },
     {
       "path": "src/components/asset/AssetTextViewer.vue",
-      "bytes": 4369
+      "bytes": 4424
     },
     {
       "path": "src/components/diff/BinaryPreviewHost.vue",
@@ -417,7 +425,7 @@
     },
     {
       "path": "src/components/unity-preview/UnityObjectPreview.vue",
-      "bytes": 75049
+      "bytes": 75358
     },
     {
       "path": "src/components/ui/BaseButton.vue",
@@ -473,11 +481,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 307315
+      "bytes": 312988
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 299280
+      "bytes": 304769
     },
     {
       "path": "src/services/asset.ts",
@@ -485,7 +493,7 @@
     },
     {
       "path": "src/services/diff.ts",
-      "bytes": 8978
+      "bytes": 9816
     },
     {
       "path": "src/services/refGraph.ts",
@@ -557,11 +565,11 @@
     },
     {
       "path": "src/services/locusRuntime.ts",
-      "bytes": 5519
+      "bytes": 5716
     },
     {
       "path": "src/types.ts",
-      "bytes": 89801
+      "bytes": 90663
     }
   ]
 }

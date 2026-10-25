@@ -32,6 +32,8 @@ const sourceFiles = [
   "src/services/project.ts",
   "src/stores/workspaceContext.ts",
   "src/services/workspaceEventHub.ts",
+  "src/services/windowEventInterests.ts",
+  "src/services/windowEventTransport.ts",
   "src/components/view/viewRuntime.ts",
   "src/components/view/viewCompiler.ts",
   "src/components/view/viewSfcCompiler.ts",

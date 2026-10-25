@@ -28,7 +28,10 @@ export function createViewHostApi(options: { viewId: string; workspaceRef: Works
       const ref = options.workspaceRef;
       if (options.scope.disposed || (visibleOnly && !options.scope.context.active.value) || event.eventName !== eventName || event.checkoutId !== ref.checkoutId || event.workspaceGeneration !== ref.expectedGeneration || !workspaceMaterializationMatches(ref.expectedMaterializationEpoch, event.materializationEpoch)) return;
       handler(event.payload);
-    }, { owner: "ViewRuntimeHost." + eventName, signal: options.scope.context.signal }));
+    }, { owner: "ViewRuntimeHost." + eventName, signal: options.scope.context.signal,
+      interests: eventName === "stream-event" ? [{ streamWorkspaceRef: options.workspaceRef }]
+        : eventName === "workspace-file-changed" ? [{ workspaceRef: options.workspaceRef }] : [],
+    }));
   }
   const subscribeViewWorkspaceStream = (handler: (event: StreamEvent) => void) => subscribeWorkspaceEvent("stream-event", handler);
 function nonEmptyString(value: string | null | undefined): string | null {

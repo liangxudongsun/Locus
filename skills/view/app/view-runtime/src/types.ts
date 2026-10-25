@@ -375,6 +375,28 @@ export interface UnityHangDiagnosis {
   frames: UnityHangFrame[];
   notes?: string[];
   error?: string | null;
+  /** Timeline assessment while the incident lasts (sampled every 5-30s). */
+  stall?: UnityStallAssessment | null;
+}
+
+export interface UnityStallAssessment {
+  kind:
+    | "unity_work"
+    | "user_code_busy"
+    | "user_code_waiting"
+    | "blocked_wait"
+    | "suspected_infinite_loop"
+    | "unknown"
+    | string;
+  owner: "unity" | "user" | "agent" | "unknown" | string;
+  forMs: number;
+  samples: number;
+  cpuPercent?: number | null;
+  /** Longest-lived project/agent call still on the stack. */
+  frame?: string | null;
+  /** The editor will not get back to its loop by itself. */
+  blocksProgress: boolean;
+  maxSuspendUs?: number | null;
 }
 
 export interface UnityNativeBrokerStatus {
@@ -510,6 +532,9 @@ export interface SessionDetail {
 
 export interface SessionViewSnapshot {
   remoteSyncWarning?: string | null;
+  /** Workspace event stream revision at which the live state was cut: events
+   * at or below it are reflected here; replay buffered events above it. */
+  streamRevision?: number | null;
   session: SessionDetail;
   userMessageIds?: string[];
   oldestMessageRowId?: number | null;

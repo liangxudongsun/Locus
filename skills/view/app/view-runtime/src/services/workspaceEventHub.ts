@@ -1,4 +1,7 @@
-import { listen, type Event, type UnlistenFn } from "@tauri-apps/api/event";
+import type { Event, UnlistenFn } from "@tauri-apps/api/event";
+import { listenWindowEvent } from "./windowEventTransport";
+import { getCurrentTauriWindowLabel } from "./tauriRuntime";
+import { flushWindowEventInterests, retainWindowEventInterest, type WindowEventInterest } from "./windowEventInterests";
 import type { RoutedWorkspaceEvent } from "./project";
 
 export const WORKSPACE_EVENT_NAME = "locus://workspace-event";
@@ -7,6 +10,7 @@ const TRACE_LIMIT = 256;
 export interface WorkspaceEventSubscriptionOptions {
   owner: string;
   signal?: AbortSignal;
+  interests?: WindowEventInterest[];
 }
 
 type WorkspaceEvent = RoutedWorkspaceEvent<unknown>;
@@ -26,11 +30,20 @@ interface Subscriber {
 
 interface Trace {
   timestampMs: number;
-  action: "subscribe" | "unsubscribe" | "receive" | "dispatch" | "error";
+  action: "subscribe" | "unsubscribe" | "receive" | "error";
   subscriptionId?: number;
+  /** receive: delivery targets in dispatch order (one trace per event, not per subscriber). */
+  subscriptionIds?: number[];
+  /** receive: synchronous time spent in all handlers for this event. */
+  dispatchMs?: number;
   owner?: string;
   envelope?: Envelope;
   error?: string;
+}
+
+export interface WorkspaceEventSnapshotOptions {
+  /** Keep only traces recorded at or after this epoch timestamp. */
+  sinceMs?: number;
 }
 
 function envelopeOf(event: WorkspaceEvent): Envelope {
@@ -50,7 +63,7 @@ function envelopeOf(event: WorkspaceEvent): Envelope {
  * This layer deliberately does not filter, deduplicate, replay or reorder workspace
  * envelopes. Consumers retain their own worktree and materialization guards.
  */
-export function createWorkspaceEventHub(transport: Transport) {
+export function createWorkspaceEventHub(transport: Transport, nativeChannelCount = 1) {
   const subscribers = new Map<number, Subscriber>();
   const traces: Trace[] = [];
   let nextId = 1;
@@ -60,10 +73,12 @@ export function createWorkspaceEventHub(transport: Transport) {
   let diagnosticsEnabled = false;
   let received = 0;
 
-  function record(trace: Omit<Trace, "timestampMs">): void {
-    if (!diagnosticsEnabled) return;
+  function record(trace: Omit<Trace, "timestampMs">): Trace | null {
+    if (!diagnosticsEnabled) return null;
     if (traces.length === TRACE_LIMIT) traces.shift();
-    traces.push({ timestampMs: Date.now(), ...trace });
+    const recorded: Trace = { timestampMs: Date.now(), ...trace };
+    traces.push(recorded);
+    return recorded;
   }
 
   function reportError(subscriber: Subscriber, event: WorkspaceEvent, error: unknown): void {
@@ -81,16 +96,19 @@ export function createWorkspaceEventHub(transport: Transport) {
   function dispatch(event: Event<WorkspaceEvent>): void {
     if (disposed) return;
     received += 1;
-    if (diagnosticsEnabled) record({ action: "receive", envelope: envelopeOf(event.payload) });
     // Snapshot excludes subscribers added during delivery; the membership check
     // also skips a subscriber removed by an earlier handler in this same event.
-    for (const subscriber of [...subscribers.values()]) {
+    const targets = [...subscribers.values()];
+    const trace = diagnosticsEnabled
+      ? record({
+        action: "receive", envelope: envelopeOf(event.payload),
+        subscriptionIds: targets.map((subscriber) => subscriber.id),
+      })
+      : null;
+    const dispatchStartedAt = trace ? performance.now() : 0;
+    for (const subscriber of targets) {
       if (!subscribers.has(subscriber.id)) continue;
       subscriber.deliveries += 1;
-      if (diagnosticsEnabled) record({
-        action: "dispatch", subscriptionId: subscriber.id, owner: subscriber.owner,
-        envelope: envelopeOf(event.payload),
-      });
       try {
         const result = subscriber.handler(event);
         if (result && typeof (result as PromiseLike<unknown>).then === "function") {
@@ -100,6 +118,7 @@ export function createWorkspaceEventHub(transport: Transport) {
         reportError(subscriber, event.payload, error);
       }
     }
+    if (trace) trace.dispatchMs = Math.round((performance.now() - dispatchStartedAt) * 100) / 100;
   }
 
   function ensureRegistered(): Promise<void> {
@@ -147,15 +166,20 @@ export function createWorkspaceEventHub(transport: Transport) {
 
   return {
     subscribe,
+    ensureRegistered,
     setDiagnosticsEnabled(enabled: boolean) {
       diagnosticsEnabled = enabled;
       if (!enabled) traces.length = 0;
     },
-    snapshot() {
+    snapshot(options: WorkspaceEventSnapshotOptions = {}) {
+      const sinceMs = options.sinceMs;
+      const selected = typeof sinceMs === "number" && Number.isFinite(sinceMs)
+        ? traces.filter((trace) => trace.timestampMs >= sinceMs)
+        : traces;
       return {
         nativeEvent: WORKSPACE_EVENT_NAME,
         state: disposed ? "disposed" : nativeRelease ? "ready" : registration ? "starting" : "idle",
-        nativeListenerCount: nativeRelease ? 1 : 0,
+        nativeListenerCount: nativeRelease ? nativeChannelCount : 0,
         received,
         subscribers: [...subscribers.values()].map((subscriber) => ({
           id: subscriber.id,
@@ -164,9 +188,10 @@ export function createWorkspaceEventHub(transport: Transport) {
           deliveries: subscriber.deliveries,
           errors: subscriber.errors,
         })),
-        traces: traces.map((trace) => ({
+        traces: selected.map((trace) => ({
           ...trace,
           ...(trace.envelope ? { envelope: { ...trace.envelope } } : {}),
+          ...(trace.subscriptionIds ? { subscriptionIds: [...trace.subscriptionIds] } : {}),
         })),
       };
     },
@@ -185,28 +210,46 @@ type WorkspaceEventHub = ReturnType<typeof createWorkspaceEventHub>;
 let windowHub: WorkspaceEventHub | undefined = import.meta.hot?.data?.workspaceEventHub;
 
 function getWindowHub(): WorkspaceEventHub {
-  windowHub ??= createWorkspaceEventHub((handler) => listen(WORKSPACE_EVENT_NAME, handler));
+  windowHub ??= createWorkspaceEventHub(
+    (handler) => listenWindowEvent(WORKSPACE_EVENT_NAME, handler),
+    getCurrentTauriWindowLabel() ? 2 : 1,
+  );
   return windowHub;
+}
+
+export function ensureWorkspaceEventTransport(): Promise<void> {
+  return getWindowHub().ensureRegistered();
 }
 
 export function listenWorkspaceEvent<T extends WorkspaceEvent>(
   owner: string,
   handler: (event: Event<T>) => unknown,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; interests?: WindowEventInterest[] } = {},
 ): Promise<UnlistenFn> {
   const subscription = getWindowHub().subscribe(handler as Handler, { owner, ...options });
-  return subscription.ready.then(() => subscription.unsubscribe);
+  const interests = options.signal?.aborted ? [] : options.interests ?? [];
+  const releases = interests.map(retainWindowEventInterest);
+  const release = () => {
+    subscription.unsubscribe();
+    releases.forEach(stop => stop());
+    options.signal?.removeEventListener("abort", release);
+  };
+  options.signal?.addEventListener("abort", release, { once: true });
+  return subscription.ready.then(async () => {
+    if (interests.length) await flushWindowEventInterests();
+    return release;
+  }).catch(error => { release(); throw error; });
 }
 
 export function setWorkspaceEventDiagnosticsEnabled(enabled: boolean): void {
   getWindowHub().setDiagnosticsEnabled(enabled);
 }
 
-export function snapshotWorkspaceEvents() {
+export function snapshotWorkspaceEvents(options: WorkspaceEventSnapshotOptions = {}) {
   const internals = typeof window === "undefined" ? undefined : (
     window as unknown as { __TAURI_INTERNALS__?: { metadata?: { currentWindow?: { label?: string } } } }
   ).__TAURI_INTERNALS__;
-  return { windowLabel: internals?.metadata?.currentWindow?.label ?? null, ...getWindowHub().snapshot() };
+  return { windowLabel: internals?.metadata?.currentWindow?.label ?? null, ...getWindowHub().snapshot(options) };
 }
 
 export function resetWorkspaceEventHubForTests(): void {

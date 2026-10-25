@@ -160,7 +160,7 @@ export function createViewDocuments(workspaceRef: WorkspaceRef, options: { signa
           ? { kind: "knowledge", type: payload.docType as KnowledgeDocumentType, path: payload.path } : undefined,
         subtree: !!payload.subtree || payload.targetKind !== "document" });
       else if (event.eventName === "workspace-file-changed") handler({ kind: "workspace", path: payload.path as string, subtree: true });
-    }, { owner: "view.documents", signal: options.signal });
+    }, { owner: "view.documents", signal: options.signal, interests: [{ workspaceRef: scope }] });
     if (options.signal?.aborted) { release(); assertLive(); }
     return release;
   }
