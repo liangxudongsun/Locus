@@ -99,10 +99,6 @@ export function synthesizeLegacyRenderParts(
     }
   };
 
-  if (options.beforeContentToolCalls) {
-    pushToolParts(options.beforeContentToolCalls, Math.max(contentSeq - 1, 1));
-  }
-
   if (message.content) {
     parts.push({
       kind: "text",
@@ -118,17 +114,34 @@ export function synthesizeLegacyRenderParts(
     pushToolParts(options.toolCalls ?? message.toolCalls, ordered ? 30 : 30);
   }
 
-  for (const [index, proposalMessage] of (options.knowledgeProposals ?? []).entries()) {
+  // Proposals follow every other part of the message, however many tools it has.
+  let proposalSeq = parts.reduce((max, part) => Math.max(max, part.order.seq), contentSeq) + 1;
+  for (const proposalMessage of options.knowledgeProposals ?? []) {
     if (!proposalMessage.knowledgeProposal) continue;
     parts.push({
       kind: "knowledgeProposal",
       id: proposalMessage.id,
-      order: legacyOrder(contentSeq + 100 + index),
+      order: legacyOrder(proposalSeq++),
       message: proposalMessage,
     });
   }
 
-  return sortedAssistantRenderParts(parts);
+  const ownParts = sortedAssistantRenderParts(parts);
+  const beforeContentToolCalls = options.beforeContentToolCalls ?? [];
+  if (beforeContentToolCalls.length === 0) return ownParts;
+
+  // Before-content tools come from earlier tool-only rows merged into this
+  // message, so they precede all of its own parts, thinking included. Their
+  // stored orders may be missing or belong to another run's sequence; row order
+  // is authoritative. Renumber the whole list: fixed offsets from contentSeq
+  // cannot reserve room for an unbounded number of merged tools.
+  const beforeParts: AssistantRenderPart[] = beforeContentToolCalls.map((toolCall, index) => ({
+    kind: "toolCall",
+    id: toolCall.id || `${message.id}:legacy-before-tool:${index}`,
+    order: legacyOrder(index + 1),
+    toolCall,
+  }));
+  return [...beforeParts, ...ownParts].map((part, index) => ({ ...part, order: legacyOrder(index + 1) }));
 }
 
 export function assertCanonicalRenderParts(parts: readonly AssistantRenderPart[], source: string) {
