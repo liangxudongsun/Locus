@@ -149,6 +149,49 @@ pub(super) fn local_function_name(item: &Value) -> String {
     }
 }
 
+/// Responses Lite renders the typed `tool_search` declaration to the model as
+/// `tool_search.tool_search_tool` (codex `tool_namespaces_info`) and can return
+/// the call as that namespaced `function_call`. Rewrite it into the typed client
+/// `tool_search_call` so execution, persistence and replay keep the
+/// `tool_search_call` / `tool_search_output` round-trip.
+pub(super) fn normalize_tool_search_call(item: &mut Value) {
+    if item["type"] != "function_call"
+        || item["namespace"] != "tool_search"
+        || item["name"] != "tool_search_tool"
+    {
+        return;
+    }
+    // The added event carries "" before arguments stream; keep strings that do
+    // not parse so deltas can still append and the executor reports bad input.
+    let arguments = item["arguments"]
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_else(|| item["arguments"].clone());
+    let mut typed = json!({"type":"tool_search_call", "call_id":item["call_id"],
+        "execution":"client", "arguments":arguments});
+    // The `fc_` item id is dropped: replaying it on a typed item is rejected
+    // (`invalid_id_prefix`, expected `tsc`). Without an id the stream keys the
+    // call by `call_id`; the done item still carries the full arguments.
+    if let Some(status) = item.get("status") {
+        typed["status"] = status.clone();
+    }
+    *item = typed;
+}
+
+/// Applies `normalize_tool_search_call` to every provider item in one event.
+pub(super) fn normalize_event_items(event: &mut Value) {
+    if let Some(item) = event.get_mut("item") {
+        normalize_tool_search_call(item);
+    }
+    if let Some(output) = event
+        .get_mut("response")
+        .and_then(|response| response.get_mut("output"))
+        .and_then(Value::as_array_mut)
+    {
+        output.iter_mut().for_each(normalize_tool_search_call);
+    }
+}
+
 /// Store custom patch calls in the existing JSON tool-call envelope. The raw
 /// provider item remains in response metadata for lossless Codex replay.
 pub(super) fn local_tool_arguments(item: &Value) -> Option<String> {

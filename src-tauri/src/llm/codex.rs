@@ -39,6 +39,8 @@ pub(crate) use diagnostics::Capture as CodexCompactionCapture;
 mod compaction_tests;
 #[cfg(test)]
 mod idle_timeout_tests;
+#[cfg(test)]
+mod tool_search_live_tests;
 mod protocol;
 pub(crate) mod server_model;
 #[cfg(test)]
@@ -2482,7 +2484,7 @@ where
                 return Ok(true);
             }
 
-            let event: serde_json::Value = match serde_json::from_str(data) {
+            let mut event: serde_json::Value = match serde_json::from_str(data) {
                 Ok(v) => v,
                 Err(e) => {
                     if debug {
@@ -2494,6 +2496,8 @@ where
                     continue;
                 }
             };
+            // Before any item is parsed, stored, or reconciled from completed output.
+            protocol::normalize_event_items(&mut event);
 
             state.last_event = event["type"].as_str().map(str::to_owned);
             state.event_count += 1;
@@ -5103,6 +5107,93 @@ mod tests {
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].0, "search_1");
         assert_eq!(started[0].1, TOOL_SEARCH_HISTORY_TOOL_NAME);
+    }
+
+    #[test]
+    fn normalizes_lite_namespaced_tool_search_call_for_execution_and_replay() {
+        let mut state = CodexStreamState::new();
+        let started = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let captured = started.clone();
+        let on_tool = move |id: String, name: String| {
+            captured
+                .lock()
+                .expect("tool mutex poisoned")
+                .push((id, name));
+        };
+        // Observed gpt-6-astra (Responses Lite) wire shape.
+        let lite_item = |arguments: &str, status: &str| {
+            serde_json::json!({"id":"fc_1", "type":"function_call", "status":status,
+                "namespace":"tool_search", "name":"tool_search_tool",
+                "call_id":"call_1", "arguments":arguments})
+        };
+        let done_item = lite_item(r#"{"wire_names":["execute_typescript"]}"#, "completed");
+        for event in [
+            serde_json::json!({"type":"response.output_item.added", "item":lite_item("", "in_progress")}),
+            serde_json::json!({"type":"response.function_call_arguments.delta", "item_id":"fc_1", "delta":"{\"wire_names\":"}),
+            serde_json::json!({"type":"response.function_call_arguments.delta", "item_id":"fc_1", "delta":"[\"execute_typescript\"]}"}),
+            serde_json::json!({"type":"response.output_item.done", "item":done_item.clone()}),
+            serde_json::json!({"type":"response.completed", "response":{"id":"resp_1", "output":[done_item]}}),
+        ] {
+            process_sse_event_block(
+                &format!("data: {event}"),
+                false,
+                &mut state,
+                &ignore_text,
+                &ignore_thinking,
+                &on_tool,
+            )
+            .expect("event should parse");
+        }
+
+        let (collected, incomplete) = collect_complete_tool_calls(&state.tool_calls_map);
+        assert_eq!(incomplete, 0);
+        assert_eq!(collected.len(), 1);
+        let call = collected[0].tool_call.clone();
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.name, TOOL_SEARCH_HISTORY_TOOL_NAME);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call.arguments).expect("arguments JSON"),
+            serde_json::json!({"wire_names":["execute_typescript"]})
+        );
+        assert_eq!(
+            *started.lock().expect("tool mutex poisoned"),
+            vec![("call_1".to_string(), TOOL_SEARCH_HISTORY_TOOL_NAME.to_string())]
+        );
+        // No `fc_` id: typed replay requires a `tsc` prefix (live-verified).
+        let typed = serde_json::json!({"type":"tool_search_call",
+            "status":"completed", "call_id":"call_1", "execution":"client",
+            "arguments":{"wire_names":["execute_typescript"]}});
+        assert_eq!(state.items_added, vec![typed.clone()]);
+
+        // The persisted provider copy replays as the typed round-trip pair.
+        let metadata = HashMap::from([(
+            "assistant-1".to_string(),
+            super::protocol::response_metadata(
+                serde_json::json!({}),
+                &state.items_added,
+                "",
+                std::slice::from_ref(&call),
+                &serde_json::json!({}),
+            ),
+        )]);
+        let input = build_input_with_metadata(
+            &[
+                assistant_message_with_tool_calls("assistant-1", "", Some("resp_1"), vec![call]),
+                tool_message("tool-1", "call_1", r#"{"tools":[]}"#),
+            ],
+            Some(&metadata),
+        );
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0], typed);
+        assert_eq!(input[1]["type"], serde_json::json!("tool_search_output"));
+        assert_eq!(input[1]["call_id"], serde_json::json!("call_1"));
+
+        // Other foreign namespaces stay qualified and are never rewritten.
+        let mut foreign = serde_json::json!({"type":"function_call", "namespace":"mcp__x",
+            "name":"tool_search_tool", "call_id":"call_2", "arguments":"{}"});
+        let original = foreign.clone();
+        super::protocol::normalize_tool_search_call(&mut foreign);
+        assert_eq!(foreign, original);
     }
 
     #[test]
