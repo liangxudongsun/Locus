@@ -67,7 +67,7 @@ Bash/Python 不支持续跑。查询和等待不会消耗通知。
 - Run 生命周期：`status()`、`wait()`、`events()`、`event_stream()`、`cancel()`、`answer()`。
 - 会话历史：`list_sessions(archived=...)` 按归档状态列出当前工作区会话，`search_sessions()` 搜索，`read_session()` 分页读取；`get_session()`、`Session.prompt()`、`Session.events()` 用于完整加载、续接和事件读取。
 - Unity 生命周期：`get_unity_editor_status(project=...)`、`ensure_unity_editor(project=...)`、`restart_unity_editor(project=...)`；查询进程、连接与语义状态，按需拉起或重启当前项目对应的编辑器并等待就绪。
-- Unity 阻塞恢复：`get_unity_dialog(project=...)`、`choose_unity_dialog(...)`、`wait_unity_execution(...)`；弹窗查询与选择由 Locus 原生窗口监听处理，不依赖 Unity 主线程。
+- Unity 阻塞恢复：`get_unity_dialog(project=...)`、`choose_unity_dialog(...)`、`wait_unity_execution(...)`、`cancel_unity_execution(...)`；弹窗查询与选择由 Locus 原生窗口监听处理，执行取消由原生 broker 记录，均不依赖 Unity 主线程。
 
 `list_models()` 默认只返回当前登录态下可用的模型。`list_models(available_only=False)` 同时返回未登录的内置模型，并通过 `available` 与 `unavailable_reason` 标明状态。模型对象包含上下文窗口、推理强度与速度档位，可供 workflow 自动选择执行配置。
 

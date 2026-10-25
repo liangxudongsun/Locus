@@ -127,6 +127,7 @@ __all__ = [
     "restart_unity_editor",
     "send_session_message",
     "wait_unity_execution",
+    "cancel_unity_execution",
     "tool",
 ]
 
@@ -335,6 +336,21 @@ async def wait_unity_execution(
         workspace_ref=workspace_ref,
         execution_id=execution_id,
         timeout=timeout,
+    )
+
+
+async def cancel_unity_execution(
+    *,
+    project: str | None = None,
+    worktree: Any = None,
+    workspace_ref: Any = None,
+    execution_id: str,
+) -> str:
+    return await _client().cancel_unity_execution(
+        project=project,
+        worktree=worktree,
+        workspace_ref=workspace_ref,
+        execution_id=execution_id,
     )
 
 

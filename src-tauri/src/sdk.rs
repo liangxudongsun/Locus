@@ -2307,6 +2307,23 @@ async fn wait_unity_execution(
     Ok(Value::String(output))
 }
 
+/// Cancel a running (typically detached) Unity execution. The broker records
+/// the cancel without the Unity main thread, so it also reaches a snippet
+/// stuck in a loop; guarded loops stop at their next iteration.
+async fn cancel_unity_execution(
+    app: &AppHandle,
+    params: WaitUnityExecutionParams,
+) -> Result<Value, String> {
+    let scope = resolve_sdk_unity_runtime(app, &params.target, "unity.execution.cancel")?;
+    let project = scope.runtime().root().to_string_lossy().into_owned();
+    let execution_id = params.execution_id.trim();
+    if execution_id.is_empty() {
+        return Err("unity.execution.cancel requires executionId".to_string());
+    }
+    let output = crate::unity_bridge::cancel_unity_execute_code(&project, execution_id).await?;
+    Ok(Value::String(output))
+}
+
 fn sdk_runtime_status(status: &str) -> SessionRuntimeStatus {
     match status {
         "queued" => SessionRuntimeStatus::Queued,
@@ -2995,6 +3012,7 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
         "unity.dialog.get" => get_unity_dialog(app, parse_params(params)?).await,
         "unity.dialog.choose" => choose_unity_dialog(app, parse_params(params)?).await,
         "unity.execution.wait" => wait_unity_execution(app, parse_params(params)?).await,
+        "unity.execution.cancel" => cancel_unity_execution(app, parse_params(params)?).await,
         "sessions.list" => list_sdk_sessions(app, parse_params(params)?).await,
         "sessions.get" => get_sdk_session(app, parse_params(params)?),
         "sessions.read" => sessions::read(app, params),

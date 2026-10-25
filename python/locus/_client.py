@@ -539,6 +539,31 @@ class Client:
         )
         return str(payload)
 
+    async def cancel_unity_execution(
+        self,
+        *,
+        project: str | None = None,
+        worktree: Any = None,
+        workspace_ref: Any = None,
+        execution_id: str,
+    ) -> str:
+        """Request cancellation of a running Unity execution.
+
+        Works while the snippet holds the Unity main thread: loops in agent
+        snippets stop at their next iteration. Follow with
+        ``wait_unity_execution`` to read the final (cancelled) result.
+        """
+        target = unity_target(project, workspace_ref, worktree)
+        execution_id = execution_id.strip()
+        if not execution_id:
+            raise ValueError("execution_id cannot be empty")
+        payload = await self.rpc(
+            "unity.execution.cancel",
+            {**target, "executionId": execution_id},
+            timeout=30,
+        )
+        return str(payload)
+
     async def list_sessions(
         self,
         *,

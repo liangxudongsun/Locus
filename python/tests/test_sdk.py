@@ -204,6 +204,8 @@ class _SdkSurfaceClient(locus.Client):
             }
         if method == "unity.execution.wait":
             return "MODAL_PROBE:cancelled"
+        if method == "unity.execution.cancel":
+            return "execute_code cancellation signaled through the native broker"
         if method == "sessions.list":
             return [
                 {
@@ -549,6 +551,25 @@ class SdkCoverageTests(unittest.IsolatedAsyncioTestCase):
             ),
             client.calls,
         )
+
+    async def test_cancels_a_detached_unity_execution(self) -> None:
+        client = _SdkSurfaceClient()
+
+        output = await client.cancel_unity_execution(
+            project=r"F:\Project",
+            execution_id=" exec-7 ",
+        )
+
+        self.assertIn("cancellation signaled", output)
+        self.assertIn(
+            (
+                "unity.execution.cancel",
+                {"project": r"F:\Project", "executionId": "exec-7"},
+            ),
+            client.calls,
+        )
+        with self.assertRaises(ValueError):
+            await client.cancel_unity_execution(project=r"F:\Project", execution_id="  ")
 
     async def test_parses_manually_closed_dialog_as_a_normal_result(self) -> None:
         result = locus.UnityDialogChoiceResult.from_payload(
