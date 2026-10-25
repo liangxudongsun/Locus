@@ -19,14 +19,21 @@ const DEFAULT_TRACE_BUFFER_MB = 64;
 const TRACE_COMPLETE_TIMEOUT_MS = 30_000;
 const STREAM_CHUNK_BYTES = 1024 * 1024;
 const STALL_CONSOLE_MODULE = "[RuntimePerformance]";
-const STALL_CONSOLE_MESSAGE = "stall detected";
+// Main-thread stalls and render delays (idle main thread waiting for a frame)
+// both trigger a capture; the saved incident's `kind` tells them apart.
+const STALL_CONSOLE_MESSAGES = ["stall detected", "render delay detected"];
 const TRACE_CATEGORIES = [
   "toplevel",
   "devtools.timeline",
   "disabled-by-default-devtools.timeline",
+  "disabled-by-default-devtools.timeline.frame",
   "blink.user_timing",
   "v8.execute",
   "disabled-by-default-v8.cpu_profiler",
+  // Compositor, GPU and display scheduling explain render delays.
+  "cc",
+  "gpu",
+  "viz",
 ];
 
 interface CliOptions {
@@ -226,7 +233,7 @@ Options:
   --browser-url <url>       Locus CDP URL; auto-detected on ports 19222-19246
   --output-dir <dir>        Capture directory, default .tmp/locus-stall-captures
   --timeout-ms <ms>         CDP discovery timeout, default ${DEFAULT_TIMEOUT_MS}
-  --max-wait-ms <ms>        Maximum wait for a stall, default ${DEFAULT_MAX_WAIT_MS}
+  --max-wait-ms <ms>        Maximum wait for a stall or render delay, default ${DEFAULT_MAX_WAIT_MS}
   --post-capture-ms <ms>    Time retained after detection, default ${DEFAULT_POST_CAPTURE_MS}
   --arm-delay-ms <ms>       Trace startup stabilization, default ${DEFAULT_ARM_DELAY_MS}
   --trace-buffer-mb <mb>    Circular trace buffer, 4-256 MB, default ${DEFAULT_TRACE_BUFFER_MB}
@@ -264,7 +271,8 @@ function isStallConsoleEvent(event: CdpEventMessage): boolean {
       ? (arg as { value?: unknown }).value
       : undefined
   ));
-  return values.includes(STALL_CONSOLE_MODULE) && values.includes(STALL_CONSOLE_MESSAGE);
+  return values.includes(STALL_CONSOLE_MODULE)
+    && STALL_CONSOLE_MESSAGES.some((message) => values.includes(message));
 }
 
 function waitForTraceComplete(cdpClient: CdpClient): Promise<TraceCompleteParams> {

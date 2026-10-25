@@ -7,6 +7,7 @@ import {
   subscribeLocusRuntimeInvokeActivity,
   type LocusRuntimeInvokeActivity,
 } from "./locusRuntime";
+import type { RuntimePerformanceContextWindow } from "./runtimePerformanceDiagnostics";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import { setWorkspaceEventDiagnosticsEnabled, snapshotWorkspaceEvents } from "./workspaceEventHub";
 
@@ -15,12 +16,23 @@ const HEARTBEAT_INTERVAL_MS = 5_000;
 const HEARTBEAT_TIMEOUT_MS = 4_000;
 const MAX_PENDING_INVOKES = 24;
 const MAX_LIFECYCLE_EVENTS = 16;
+const INCIDENT_LIFECYCLE_EVENTS = 8;
+// Workspace traces shortly before a stall show what was delivered into it.
+const INCIDENT_WORKSPACE_TRACE_LEAD_MS = 1_000;
 const DEBUG_MODE_STORAGE_KEY = "locus:webview-bridge:debug-enabled:v1";
-const LIFECYCLE_STORAGE_KEY = "locus:webview-bridge:lifecycle:v1";
-const STALL_STORAGE_KEY = "locus:webview-bridge:stall:v1";
+// v1 shared one key across every window of the origin, mixing their lifecycles.
+const LEGACY_LIFECYCLE_STORAGE_KEY = "locus:webview-bridge:lifecycle:v1";
+const LEGACY_STALL_STORAGE_KEY = "locus:webview-bridge:stall:v1";
+// v2 keys are per window label. Workspace window labels are unique per window,
+// so keys of closed windows are pruned by age and count.
+const LIFECYCLE_STORAGE_PREFIX = "locus:webview-bridge:lifecycle:v2:";
+const STALL_STORAGE_PREFIX = "locus:webview-bridge:stall:v2:";
+const WINDOW_STORAGE_RETENTION_MS = 3 * 24 * 60 * 60_000;
+const MAX_WINDOW_STORAGE_KEYS = 16;
 
 interface TauriInternals {
   callbacks?: Map<unknown, unknown> | Record<string, unknown>;
+  metadata?: { currentWindow?: { label?: string } };
 }
 
 interface PendingInvoke {
@@ -76,6 +88,8 @@ let expectedHeartbeatAt = 0;
 let lastEventLoopLagMs = 0;
 let stallReportedForRequest = false;
 let lifecycleEvents: FrontendLifecycleEvent[] = [];
+let lifecycleStorageKey = `${LIFECYCLE_STORAGE_PREFIX}unknown`;
+let stallStorageKey = `${STALL_STORAGE_PREFIX}unknown`;
 const pendingInvokes = new Map<number, PendingInvoke>();
 const sessionId = createSessionId();
 type RuntimePerformanceDiagnosticsModule = typeof import("./runtimePerformanceDiagnostics");
@@ -132,8 +146,53 @@ function removeStoredValue(key: string): void {
   }
 }
 
+function currentWindowLabel(): string {
+  const label = getTauriInternals()?.metadata?.currentWindow?.label;
+  return typeof label === "string" && label ? label : "unknown";
+}
+
+function storedActivityMs(raw: string | null): number {
+  try {
+    const value: unknown = raw ? JSON.parse(raw) : null;
+    if (Array.isArray(value)) {
+      return value.reduce<number>((latest, event) => {
+        const timestampMs = (event as { timestampMs?: unknown } | null)?.timestampMs;
+        return typeof timestampMs === "number" && timestampMs > latest ? timestampMs : latest;
+      }, 0);
+    }
+    const detectedAtMs = (value as { detectedAtMs?: unknown } | null)?.detectedAtMs;
+    return typeof detectedAtMs === "number" ? detectedAtMs : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function pruneWindowDiagnosticsStorage(currentLabel: string, nowMs: number): void {
+  try {
+    const storage = window.localStorage;
+    storage.removeItem(LEGACY_LIFECYCLE_STORAGE_KEY);
+    storage.removeItem(LEGACY_STALL_STORAGE_KEY);
+    for (const prefix of [LIFECYCLE_STORAGE_PREFIX, STALL_STORAGE_PREFIX]) {
+      const others: Array<{ key: string; activityMs: number }> = [];
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (!key?.startsWith(prefix) || key === `${prefix}${currentLabel}`) continue;
+        others.push({ key, activityMs: storedActivityMs(storage.getItem(key)) });
+      }
+      others.sort((left, right) => right.activityMs - left.activityMs);
+      others.forEach((entry, index) => {
+        if (index >= MAX_WINDOW_STORAGE_KEYS - 1 || nowMs - entry.activityMs > WINDOW_STORAGE_RETENTION_MS) {
+          storage.removeItem(entry.key);
+        }
+      });
+    }
+  } catch {
+    // Diagnostics must remain best-effort when storage is unavailable.
+  }
+}
+
 function loadLifecycleEvents(): FrontendLifecycleEvent[] {
-  const stored = readStoredJson<FrontendLifecycleEvent[]>(LIFECYCLE_STORAGE_KEY);
+  const stored = readStoredJson<FrontendLifecycleEvent[]>(lifecycleStorageKey);
   return Array.isArray(stored) ? stored.slice(-MAX_LIFECYCLE_EVENTS) : [];
 }
 
@@ -146,7 +205,7 @@ function appendLifecycleEvent(event: string, detail?: string): void {
     ...(detail ? { detail } : {}),
   });
   lifecycleEvents = lifecycleEvents.slice(-MAX_LIFECYCLE_EVENTS);
-  writeStoredJson(LIFECYCLE_STORAGE_KEY, lifecycleEvents);
+  writeStoredJson(lifecycleStorageKey, lifecycleEvents);
 }
 
 function callbackCount(): number | null {
@@ -189,19 +248,25 @@ function buildHeartbeat(): FrontendBridgeHeartbeat {
     callbackCount: callbackCount(),
     pendingInvokes: snapshotPendingInvokes(pendingInvokes.values(), now),
     lifecycle: lifecycleEvents.slice(-MAX_LIFECYCLE_EVENTS),
-    recoveredStall: readStoredJson<FrontendBridgeStallSnapshot>(STALL_STORAGE_KEY),
+    recoveredStall: readStoredJson<FrontendBridgeStallSnapshot>(stallStorageKey),
   };
 }
 
-function runtimePerformanceContext(): Record<string, unknown> {
+// Incident context covers only this page lifetime and the incident's time range.
+// The heartbeat keeps the full persisted lifecycle for reload/crash diagnosis.
+function runtimePerformanceContext(incident: RuntimePerformanceContextWindow): Record<string, unknown> {
   const now = Date.now();
   return {
     sessionId,
     eventLoopLagMs: lastEventLoopLagMs,
     callbackCount: callbackCount(),
     pendingInvokes: snapshotPendingInvokes(pendingInvokes.values(), now),
-    lifecycle: lifecycleEvents.slice(-MAX_LIFECYCLE_EVENTS),
-    workspaceEvents: snapshotWorkspaceEvents(),
+    lifecycle: lifecycleEvents
+      .filter((event) => event.sessionId === sessionId)
+      .slice(-INCIDENT_LIFECYCLE_EVENTS),
+    workspaceEvents: snapshotWorkspaceEvents({
+      sinceMs: incident.approximateStartedAtMs - INCIDENT_WORKSPACE_TRACE_LEAD_MS,
+    }),
   };
 }
 
@@ -269,7 +334,7 @@ function persistHeartbeatTimeout(heartbeat: FrontendBridgeHeartbeat): void {
       recoveredStall: null,
     },
   };
-  writeStoredJson(STALL_STORAGE_KEY, snapshot);
+  writeStoredJson(stallStorageKey, snapshot);
   if (!stallReportedForRequest) {
     stallReportedForRequest = true;
     console.error("[WebViewBridge] frontend heartbeat timed out", snapshot);
@@ -300,7 +365,7 @@ async function sendHeartbeat(): Promise<void> {
         );
       }),
     ]);
-    if (heartbeat.recoveredStall) removeStoredValue(STALL_STORAGE_KEY);
+    if (heartbeat.recoveredStall) removeStoredValue(stallStorageKey);
   } catch {
     if (heartbeatRequest === request) persistHeartbeatTimeout(heartbeat);
   } finally {
@@ -345,6 +410,10 @@ function startDiagnostics(): void {
     } catch {
       // The native watchdog still captures the host side without local storage.
     }
+    const label = currentWindowLabel();
+    lifecycleStorageKey = `${LIFECYCLE_STORAGE_PREFIX}${label}`;
+    stallStorageKey = `${STALL_STORAGE_PREFIX}${label}`;
+    pruneWindowDiagnosticsStorage(label, Date.now());
     lifecycleEvents = loadLifecycleEvents();
     appendLifecycleEvent("diagnostics-start", `navigation=${navigationType() ?? "unknown"}`);
     window.addEventListener("pageshow", handlePageShow);

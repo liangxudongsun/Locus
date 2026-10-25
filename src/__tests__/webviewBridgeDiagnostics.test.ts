@@ -110,6 +110,46 @@ describe("webview bridge diagnostics", () => {
     expect(isRuntimePerformanceDiagnosticsRunning()).toBe(false);
   });
 
+  it("stores lifecycle per window and prunes legacy, stale and excess window keys", () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60_000;
+    const lifecycle = (timestampMs: number) => JSON.stringify([
+      { event: "pagehide", timestampMs, sessionId: "previous", href: "http://tauri.localhost/" },
+    ]);
+    const internals = installReadOnlyTauriInvoke(async () => undefined);
+    internals.metadata = { currentWindow: { label: "main" } };
+    localStorage.setItem("locus:webview-bridge:lifecycle:v1", lifecycle(now));
+    localStorage.setItem("locus:webview-bridge:stall:v1", JSON.stringify({ id: "legacy", detectedAtMs: now }));
+    localStorage.setItem("locus:webview-bridge:lifecycle:v2:workspace-app-fresh", lifecycle(now - 60_000));
+    localStorage.setItem("locus:webview-bridge:lifecycle:v2:workspace-app-stale", lifecycle(now - 4 * dayMs));
+    localStorage.setItem(
+      "locus:webview-bridge:stall:v2:workspace-app-stale",
+      JSON.stringify({ id: "stale", detectedAtMs: now - 4 * dayMs }),
+    );
+    for (let index = 0; index < 20; index += 1) {
+      localStorage.setItem(
+        `locus:webview-bridge:lifecycle:v2:workspace-app-old-${index}`,
+        lifecycle(now - 120_000 - index * 1_000),
+      );
+    }
+    enableStartupDiagnostics();
+
+    initWebviewBridgeDiagnostics();
+
+    expect(localStorage.getItem("locus:webview-bridge:lifecycle:v1")).toBeNull();
+    expect(localStorage.getItem("locus:webview-bridge:stall:v1")).toBeNull();
+    expect(localStorage.getItem("locus:webview-bridge:lifecycle:v2:workspace-app-stale")).toBeNull();
+    expect(localStorage.getItem("locus:webview-bridge:stall:v2:workspace-app-stale")).toBeNull();
+    expect(localStorage.getItem("locus:webview-bridge:lifecycle:v2:workspace-app-fresh")).not.toBeNull();
+    const otherWindowKeys = Object.keys(localStorage).filter((key) => (
+      key.startsWith("locus:webview-bridge:lifecycle:v2:") && !key.endsWith(":main")
+    ));
+    expect(otherWindowKeys).toHaveLength(15);
+    const own = JSON.parse(localStorage.getItem("locus:webview-bridge:lifecycle:v2:main") ?? "[]");
+    expect(own.map((event: { event: string }) => event.event)).toEqual(["diagnostics-start"]);
+  });
+
   it("tracks project-owned runtime invokes without mutating Tauri internals", async () => {
     let resolveRequest!: (value: string) => void;
     const nativeRequest = new Promise<string>((resolve) => {

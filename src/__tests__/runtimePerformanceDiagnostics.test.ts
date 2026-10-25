@@ -2,6 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  isRenderDelayedFrame,
   isRuntimePerformanceDiagnosticsRunning,
   snapshotLongAnimationFrame,
   startRuntimePerformanceDiagnostics,
@@ -70,10 +71,13 @@ describe("runtime performance diagnostics", () => {
       startTimeMs: 100,
       durationMs: 600,
       blockingDurationMs: 470,
+      renderStartDelayMs: 520,
       renderDurationMs: 80,
       styleAndLayoutDurationMs: 40,
+      scriptDurationMs: 520,
       firstUiEventTimestampMs: 105,
     });
+    expect(isRenderDelayedFrame(snapshot)).toBe(false);
     expect(snapshot.scripts[0]).toMatchObject({
       durationMs: 520,
       forcedStyleAndLayoutDurationMs: 45,
@@ -117,12 +121,94 @@ describe("runtime performance diagnostics", () => {
 
     expect(incidents).toHaveLength(1);
     expect(incidents[0]).toMatchObject({
+      kind: "main-thread",
       durationMs: 500,
       triggers: ["long-animation-frame"],
       context: {
         pendingInvokes: [{ command: "slow_command", ageMs: 800 }],
       },
     });
+  });
+
+  it("reports an idle wait before rendering as a render delay, not a stall", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("PerformanceObserver", MockPerformanceObserver);
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const getContext = vi.fn(() => ({}));
+
+    startRuntimePerformanceDiagnostics({ now: () => 1_000, warmupMs: 0, coalesceDelayMs: 0, getContext });
+    info.mockClear();
+
+    MockPerformanceObserver.instances[0]?.emit([{
+      name: "long-animation-frame",
+      entryType: "long-animation-frame",
+      startTime: 400,
+      duration: 330,
+      blockingDuration: 0,
+      renderStart: 729,
+      styleAndLayoutStart: 729.5,
+      scripts: [],
+      toJSON: () => ({}),
+    } as PerformanceEntry]);
+    vi.advanceTimersByTime(0);
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledOnce();
+    const [module, message, summary, incident] = info.mock.calls[0] as [string, string, string, RuntimePerformanceIncident];
+    expect(module).toBe("[RuntimePerformance]");
+    expect(message).toBe("render delay detected");
+    expect(summary).toContain("render-delay 330ms");
+    expect(summary).toContain("renderStartDelay=329ms");
+    expect(incident).toMatchObject({
+      kind: "render-delay",
+      longAnimationFrame: { renderStartDelayMs: 329, scriptDurationMs: 0 },
+    });
+    expect(typeof incident.hasFocus).toBe("boolean");
+    expect(getContext).toHaveBeenCalledWith({
+      approximateStartedAtMs: incident.approximateStartedAtMs,
+      detectedAtMs: incident.detectedAtMs,
+    });
+  });
+
+  it("keeps a merged incident on the main thread when any frame did script work", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("PerformanceObserver", MockPerformanceObserver);
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    startRuntimePerformanceDiagnostics({ now: () => 2_000, warmupMs: 0, coalesceDelayMs: 0 });
+
+    MockPerformanceObserver.instances[0]?.emit([
+      {
+        name: "long-animation-frame",
+        entryType: "long-animation-frame",
+        startTime: 100,
+        duration: 400,
+        blockingDuration: 0,
+        renderStart: 499,
+        scripts: [],
+        toJSON: () => ({}),
+      },
+      {
+        name: "long-animation-frame",
+        entryType: "long-animation-frame",
+        startTime: 520,
+        duration: 300,
+        blockingDuration: 230,
+        renderStart: 815,
+        scripts: [{ duration: 280, invoker: "BUTTON.onclick", invokerType: "event-listener" }],
+        toJSON: () => ({}),
+      },
+    ] as unknown as PerformanceEntry[]);
+    vi.advanceTimersByTime(0);
+
+    expect(warn).toHaveBeenCalledOnce();
+    const [, message, summary, incident] = warn.mock.calls[0] as [string, string, string, RuntimePerformanceIncident];
+    expect(message).toBe("stall detected");
+    expect(incident.kind).toBe("main-thread");
+    expect(incident.durationMs).toBe(720);
+    expect(summary).toContain("main-thread 720ms");
   });
 
   it("reports a two-second burst of medium long frames as one jank incident", () => {
@@ -153,9 +239,11 @@ describe("runtime performance diagnostics", () => {
 
     expect(incidents).toHaveLength(1);
     expect(incidents[0]).toMatchObject({
+      kind: "main-thread",
       durationMs: 1_300,
       triggers: ["jank-burst"],
       jankBurst: {
+        renderDelayedFrameCount: 0,
         windowStartTimeMs: 100,
         windowEndTimeMs: 1_400,
         windowDurationMs: 1_300,

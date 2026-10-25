@@ -11,12 +11,29 @@ const MAX_REPORTABLE_STALL_MS = 30_000;
 const MAX_SCRIPT_ATTRIBUTIONS = 8;
 const MAX_JANK_FRAME_SAMPLES = 16;
 const MAX_STRING_CHARS = 512;
+// A frame counts as a render delay only when no task reached 50 ms and the
+// attributed scripts plus the rendering phase stayed below this share.
+const RENDER_DELAY_MAX_BUSY_FRACTION = 0.25;
 const TRACE_MEASURE_NAME = "locus.runtime-stall";
+const STALL_MESSAGE = "stall detected";
+const RENDER_DELAY_MESSAGE = "render delay detected";
 
 type StallTrigger = "jank-burst" | "long-animation-frame" | "longtask" | "watchdog";
 
+/**
+ * `main-thread`: a task, timer drift or script work kept the renderer busy.
+ * `render-delay`: the main thread was idle while the next rendering update
+ * waited, so the delay lives in the compositor/GPU/host pipeline, not in JS.
+ */
+export type RuntimeStallKind = "main-thread" | "render-delay";
+
 export interface RuntimePerformanceContext {
   [key: string]: unknown;
+}
+
+export interface RuntimePerformanceContextWindow {
+  approximateStartedAtMs: number;
+  detectedAtMs: number;
 }
 
 export interface RuntimePerformanceScriptAttribution {
@@ -35,8 +52,12 @@ export interface RuntimeLongAnimationFrameSnapshot {
   startTimeMs: number;
   durationMs: number;
   blockingDurationMs: number;
+  /** Time from the frame's first task to the start of rendering; null without a rendering phase. */
+  renderStartDelayMs: number | null;
   renderDurationMs: number;
   styleAndLayoutDurationMs: number;
+  /** Sum of every attributed script, including those beyond the bounded `scripts` list. */
+  scriptDurationMs: number;
   firstUiEventTimestampMs: number | null;
   scripts: RuntimePerformanceScriptAttribution[];
 }
@@ -49,6 +70,7 @@ export interface RuntimeJankBurstSnapshot {
   totalFrameDurationMs: number;
   totalBlockingDurationMs: number;
   maxFrameDurationMs: number;
+  renderDelayedFrameCount: number;
   frames: Array<{
     startTimeMs: number;
     durationMs: number;
@@ -71,12 +93,14 @@ export interface RuntimePerformanceInteractionSnapshot {
 
 export interface RuntimePerformanceIncident {
   id: string;
+  kind: RuntimeStallKind;
   detectedAtMs: number;
   approximateStartedAtMs: number;
   performanceStartMs: number;
   durationMs: number;
   triggers: StallTrigger[];
   visibilityState: string;
+  hasFocus: boolean;
   href: string;
   activeElement: RuntimePerformanceInteractionSnapshot["target"];
   lastInteraction: RuntimePerformanceInteractionSnapshot | null;
@@ -100,7 +124,7 @@ export interface RuntimePerformanceIncident {
 }
 
 export interface RuntimePerformanceDiagnosticsOptions {
-  getContext?: () => RuntimePerformanceContext;
+  getContext?: (window: RuntimePerformanceContextWindow) => RuntimePerformanceContext;
   reportIncident?: (incident: RuntimePerformanceIncident) => void;
   now?: () => number;
   stallThresholdMs?: number;
@@ -146,6 +170,7 @@ interface PendingIncident {
   startTimeMs: number;
   endTimeMs: number;
   triggers: Set<StallTrigger>;
+  mainThreadEvidence: boolean;
   watchdogDriftMs: number | null;
   longAnimationFrame: RuntimeLongAnimationFrameSnapshot | null;
   jankBurst: RuntimeJankBurstSnapshot | null;
@@ -246,15 +271,23 @@ export function snapshotLongAnimationFrame(
   const styleAndLayoutStartMs = finiteNumber(entry.styleAndLayoutStart);
   const firstUiEventTimestampMs = optionalFiniteNumber(entry.firstUIEventTimestamp);
   const scripts = Array.isArray(entry.scripts) ? entry.scripts : [];
+  const scriptDurationMs = scripts.reduce(
+    (total, script) => total + Math.max(0, finiteNumber(script.duration)),
+    0,
+  );
 
   return {
     startTimeMs: roundMs(startTimeMs),
     durationMs: roundMs(durationMs),
     blockingDurationMs: roundMs(Math.max(0, finiteNumber(entry.blockingDuration))),
+    renderStartDelayMs: renderStartMs > 0
+      ? roundMs(Math.min(durationMs, Math.max(0, renderStartMs - startTimeMs)))
+      : null,
     renderDurationMs: roundMs(renderStartMs > 0 ? Math.max(0, endTimeMs - renderStartMs) : 0),
     styleAndLayoutDurationMs: roundMs(
       styleAndLayoutStartMs > 0 ? Math.max(0, endTimeMs - styleAndLayoutStartMs) : 0,
     ),
+    scriptDurationMs: roundMs(scriptDurationMs),
     firstUiEventTimestampMs: firstUiEventTimestampMs !== null && firstUiEventTimestampMs > 0
       ? firstUiEventTimestampMs
       : null,
@@ -279,6 +312,58 @@ export function snapshotLongAnimationFrame(
   };
 }
 
+/**
+ * Conservative on purpose: any task of 50 ms or more (non-zero blocking
+ * duration) keeps the frame classified as main-thread work.
+ */
+export function isRenderDelayedFrame(frame: RuntimeLongAnimationFrameSnapshot): boolean {
+  if (frame.renderStartDelayMs === null || frame.durationMs <= 0) return false;
+  if (frame.blockingDurationMs > 0) return false;
+  const busyMs = frame.scriptDurationMs + frame.renderDurationMs;
+  return busyMs <= frame.durationMs * RENDER_DELAY_MAX_BUSY_FRACTION;
+}
+
+function candidateHasMainThreadEvidence(candidate: StallCandidate): boolean {
+  if (candidate.trigger === "watchdog" || candidate.trigger === "longtask") return true;
+  if (candidate.jankBurst) {
+    return candidate.jankBurst.renderDelayedFrameCount < candidate.jankBurst.frameCount;
+  }
+  return !candidate.longAnimationFrame || !isRenderDelayedFrame(candidate.longAnimationFrame);
+}
+
+function formatMs(value: number): string {
+  return `${Math.round(value)}ms`;
+}
+
+/** One-line summary placed before the JSON payload so truncated log views stay readable. */
+export function summarizeRuntimePerformanceIncident(incident: RuntimePerformanceIncident): string {
+  const parts = [`${incident.kind} ${formatMs(incident.durationMs)}`, `triggers=${incident.triggers.join(",")}`];
+  const frame = incident.longAnimationFrame;
+  if (frame) {
+    parts.push(
+      `blocking=${formatMs(frame.blockingDurationMs)}`,
+      `scripts=${formatMs(frame.scriptDurationMs)}`,
+      `renderStartDelay=${frame.renderStartDelayMs === null ? "n/a" : formatMs(frame.renderStartDelayMs)}`,
+      `render=${formatMs(frame.renderDurationMs)}`,
+    );
+    const top = frame.scripts[0];
+    if (top) {
+      const source = top.sourceUrl ? top.sourceUrl.split("/").pop() : "";
+      const location = [top.sourceFunctionName, source].filter(Boolean).join("@");
+      parts.push(`top=${formatMs(top.durationMs)} ${top.invokerType}:${top.invoker}${location ? ` ${location}` : ""}`);
+    }
+  }
+  if (incident.jankBurst) {
+    parts.push(
+      `frames=${incident.jankBurst.frameCount}`,
+      `framesTotal=${formatMs(incident.jankBurst.totalFrameDurationMs)}`,
+    );
+  }
+  if (incident.watchdogDriftMs !== null) parts.push(`watchdogDrift=${formatMs(incident.watchdogDriftMs)}`);
+  parts.push(`focus=${incident.hasFocus ? "yes" : "no"}`, `visibility=${incident.visibilityState}`);
+  return parts.join(" ");
+}
+
 function readMemorySnapshot(): RuntimePerformanceIncident["memory"] {
   const memory = (performance as Performance & {
     memory?: {
@@ -295,18 +380,34 @@ function readMemorySnapshot(): RuntimePerformanceIncident["memory"] {
   };
 }
 
-function safelyReadContext(provider: RuntimePerformanceDiagnosticsOptions["getContext"]): RuntimePerformanceContext {
+function safelyReadContext(
+  provider: RuntimePerformanceDiagnosticsOptions["getContext"],
+  window: RuntimePerformanceContextWindow,
+): RuntimePerformanceContext {
   if (!provider) return {};
   try {
-    const context = provider();
+    const context = provider(window);
     return context && typeof context === "object" ? context : {};
   } catch (error) {
     return { contextError: error instanceof Error ? error.message : String(error) };
   }
 }
 
+function documentHasFocus(): boolean {
+  try {
+    return typeof document.hasFocus === "function" && document.hasFocus();
+  } catch {
+    return false;
+  }
+}
+
 function defaultReportIncident(incident: RuntimePerformanceIncident): void {
-  console.warn("[RuntimePerformance]", "stall detected", incident);
+  const summary = summarizeRuntimePerformanceIncident(incident);
+  if (incident.kind === "render-delay") {
+    console.info("[RuntimePerformance]", RENDER_DELAY_MESSAGE, summary, incident);
+  } else {
+    console.warn("[RuntimePerformance]", STALL_MESSAGE, summary, incident);
+  }
 }
 
 function markIncidentInPerformanceTimeline(incident: RuntimePerformanceIncident): void {
@@ -338,16 +439,19 @@ function reportPendingIncident(state: RunningDiagnostics): void {
   const detectedPerformanceMs = state.options.now();
   const detectedAtMs = Date.now();
   const durationMs = Math.max(0, pending.endTimeMs - pending.startTimeMs);
+  const approximateStartedAtMs = Math.round(
+    detectedAtMs - Math.max(0, detectedPerformanceMs - pending.startTimeMs),
+  );
   const incident: RuntimePerformanceIncident = {
     id: `${detectedAtMs}-${nextIncidentSequence++}`,
+    kind: pending.mainThreadEvidence ? "main-thread" : "render-delay",
     detectedAtMs,
-    approximateStartedAtMs: Math.round(
-      detectedAtMs - Math.max(0, detectedPerformanceMs - pending.startTimeMs),
-    ),
+    approximateStartedAtMs,
     performanceStartMs: roundMs(pending.startTimeMs),
     durationMs: roundMs(durationMs),
     triggers: Array.from(pending.triggers).sort(),
     visibilityState: document.visibilityState,
+    hasFocus: documentHasFocus(),
     href: boundedString(window.location.href, 1_000),
     activeElement: elementSnapshot(document.activeElement),
     lastInteraction: state.lastInteraction,
@@ -361,7 +465,7 @@ function reportPendingIncident(state: RunningDiagnostics): void {
       elementCount: document.getElementsByTagName("*").length,
     },
     memory: readMemorySnapshot(),
-    context: safelyReadContext(state.options.getContext),
+    context: safelyReadContext(state.options.getContext, { approximateStartedAtMs, detectedAtMs }),
   };
 
   markIncidentInPerformanceTimeline(incident);
@@ -403,6 +507,7 @@ function mergeCandidate(state: RunningDiagnostics, candidate: StallCandidate): v
     startTimeMs: candidate.startTimeMs,
     endTimeMs: candidateEndMs,
     triggers: new Set<StallTrigger>(),
+    mainThreadEvidence: false,
     watchdogDriftMs: null,
     longAnimationFrame: null,
     jankBurst: null,
@@ -411,6 +516,8 @@ function mergeCandidate(state: RunningDiagnostics, candidate: StallCandidate): v
   target.startTimeMs = Math.min(target.startTimeMs, candidate.startTimeMs);
   target.endTimeMs = Math.max(target.endTimeMs, candidateEndMs);
   target.triggers.add(candidate.trigger);
+  // A merged incident is a render delay only if every contributing signal is one.
+  target.mainThreadEvidence ||= candidateHasMainThreadEvidence(candidate);
   if (candidate.watchdogDriftMs !== undefined) {
     target.watchdogDriftMs = Math.max(target.watchdogDriftMs ?? 0, candidate.watchdogDriftMs);
   }
@@ -513,6 +620,7 @@ function trackMediumFrameBurst(
       0,
     )),
     maxFrameDurationMs: roundMs(largestFrame.durationMs),
+    renderDelayedFrameCount: state.jankFrames.filter(isRenderDelayedFrame).length,
     frames: state.jankFrames.slice(-MAX_JANK_FRAME_SAMPLES).map((frame) => ({
       startTimeMs: roundMs(frame.startTimeMs),
       durationMs: roundMs(frame.durationMs),
