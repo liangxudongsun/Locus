@@ -304,6 +304,11 @@ pub fn finish(call: &NativeCall, output: &str, is_error: bool) -> Value {
             let Some(total) = total else {
                 return deny("Read output was capped or unrecognized; retry with a smaller limit");
             };
+            // Byte-capped reads are valid partial results when the real total is
+            // known. Keep the cap and continuation hint outside the file content.
+            if summary.starts_with("(Output capped at ") {
+                context.push(summary.to_string());
+            }
             json!({"type":"text","file":{"filePath":call.input["file_path"],
                 "content":lines.join("\n"),"numLines":lines.len(),"startLine":start,"totalLines":total}})
         }
@@ -431,7 +436,80 @@ mod tests {
     }
 
     #[test]
-    fn text_read_rejects_capped_or_malformed_frames_without_silent_data_loss() {
+    fn text_read_accepts_capped_frames_and_preserves_context() {
+        let call = adapt("capped-read", "Read", &json!({"file_path":"file.txt","offset":7})).unwrap();
+        let summary = "(Output capped at 50KB. Showing lines 7-8 of 100. Use offset=9 to continue.)";
+        let result = super::super::ClaudeCodeToolResult {
+            output: format!("<content>\n7\t段落\n8\t1\tkeep this tab\n\n{summary}\n</content>\n\nSkill runtime ready"),
+            is_error: false,
+            images: None,
+            context: vec!["Background task completed".into()],
+        };
+        let answer = finish_result(&call, &result, None);
+        assert!(answer.get("deny").is_none(), "{answer}");
+        assert_eq!(answer["result"]["file"], json!({
+            "filePath":"file.txt", "content":"段落\n1\tkeep this tab",
+            "numLines":2, "startLine":7, "totalLines":100,
+        }));
+        assert_eq!(answer["context"], json!([
+            "Skill runtime ready", summary, "Background task completed",
+        ]));
+    }
+
+    #[tokio::test]
+    async fn text_read_byte_cap_round_trips_builtin_output_and_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let expected: Vec<String> = (1..=160)
+            .map(|line| format!("{line}\t{}", "段落".repeat(150)))
+            .collect();
+        std::fs::write(root.path().join("capped.md"), expected.join("\n")).unwrap();
+        let registry = crate::tool::ToolRegistry::with_builtins();
+        let mut collected = Vec::new();
+        let mut offset = 1;
+        let mut capped_reads = 0;
+        while offset <= expected.len() {
+            let call = adapt("capped-read", "Read", &json!({
+                "file_path":"capped.md", "offset":offset, "limit":2000,
+            })).unwrap();
+            let result: super::super::ClaudeCodeToolResult = registry.execute_with_context(
+                call.locus_name,
+                &call.locus_input,
+                crate::tool::ToolExecutionContext {
+                    working_dir: Some(root.path().to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            ).await.into();
+            assert!(!result.is_error, "{}", result.output);
+            let answer = finish_result(&call, &result, None);
+            assert!(answer.get("deny").is_none(), "{answer}");
+            let file = &answer["result"]["file"];
+            assert_eq!(file["startLine"], json!(offset));
+            assert_eq!(file["totalLines"], json!(expected.len()));
+            let count = file["numLines"].as_u64().unwrap() as usize;
+            assert!(count > 0 && count <= expected.len() - offset + 1);
+            assert_eq!(file["content"], expected[offset - 1..offset - 1 + count].join("\n"));
+            let next = offset + count;
+            if next <= expected.len() {
+                let summary = format!(
+                    "(Output capped at 50KB. Showing lines {}-{} of {}. Use offset={} to continue.)",
+                    offset, next - 1, expected.len(), next,
+                );
+                assert!(result.output.contains(&summary));
+                assert_eq!(answer["context"], json!([summary]));
+                capped_reads += 1;
+            } else {
+                assert!(result.output.contains("(End of file — 160 lines total)"));
+                assert!(answer.get("context").is_none());
+            }
+            collected.extend(file["content"].as_str().unwrap().lines().map(str::to_string));
+            offset = next;
+        }
+        assert!(capped_reads >= 2, "fixture must exercise capped reads at noninitial offsets");
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn text_read_rejects_unknown_totals_or_malformed_frames_without_silent_data_loss() {
         let call = adapt("bad-read", "Read", &json!({"file_path":"file.txt"})).unwrap();
         for output in [
             "<content>\n1\tline\n\n(Output capped at 50KB. Showing lines 1-1. Use offset=2 to continue.)\n</content>",

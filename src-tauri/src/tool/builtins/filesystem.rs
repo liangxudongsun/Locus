@@ -483,8 +483,8 @@ pub(super) fn read() -> ToolDef {
 
                             if truncated_by_bytes {
                                 output.push_str(&format!(
-                                    "\n\n(Output capped at 50KB. Showing lines {}-{}. Use offset={} to continue.)",
-                                    offset, last_read_line, last_read_line + 1
+                                    "\n\n(Output capped at 50KB. Showing lines {}-{} of {}. Use offset={} to continue.)",
+                                    offset, last_read_line, total, last_read_line + 1
                                 ));
                             } else if has_more {
                                 output.push_str(&format!(

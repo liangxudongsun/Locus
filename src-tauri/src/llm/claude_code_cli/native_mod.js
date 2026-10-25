@@ -63,6 +63,29 @@ async function registerTools($, tools, registeredTools, toolPlacements) {
   }
 }
 
+// The host/journal uses MCP content, but tools registered through Mods bypass
+// Claude's MCP renderer: tool.call returns API content blocks directly. Convert
+// here for both fresh and replayed receipts, before native history stores them.
+// Native Read has its own file envelope/renderer and must not use this adapter.
+function nativeToolContent(result) {
+  if (!Array.isArray(result)) return result;
+  return result.map(block => {
+    if (block.type !== 'image' || block.source) return block;
+    return { type: 'image', source: { type: 'base64', media_type: block.mimeType, data: block.data } };
+  });
+}
+
+// Display receipts are not model results. Never echo media back through the
+// 1 MiB HTTP event endpoint after it has already reached native history. The
+// character cap also leaves room for JSON's worst-case six-byte escaping.
+function toolResultDisplay(content) {
+  const text = typeof content === 'string' ? content : JSON.stringify(content, (_key, block) =>
+    block && ['image', 'document'].includes(block.type)
+      ? { type: block.type, omitted: 'Media retained in native history' } : block) ?? '';
+  const limit = 64 * 1024;
+  return text.length <= limit ? text : text.slice(0, limit) + '\n[Display truncated; full result retained in native history.]';
+}
+
 // Correct only NEW attachment rows (see session.append below). Re-rendering
 // old prompt.attachment rows on resume would change an already-cached prefix.
 function correctDeferredToolNotice(text, toolPlacements) {
@@ -366,7 +389,7 @@ export function register(on) {
         if (block.type !== 'tool_result' || !toolScopes.has(block.tool_use_id)) continue;
         const scope = toolScopes.get(block.tool_use_id);
         await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: scope.runId,
-          id: block.tool_use_id, output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+          id: block.tool_use_id, output: toolResultDisplay(!block.is_error && typeof scope.displayOutput === 'string' ? scope.displayOutput : block.content),
           isError: block.is_error === true });
         toolScopes.delete(block.tool_use_id);
       }
@@ -662,11 +685,13 @@ export function register(on) {
     if (answer.callId !== tool_use_id) throw new Error('Locus tool call ID mismatch');
     if (answer.deny) return { deny: answer.deny };
     if (!Object.hasOwn(answer, 'result')) throw new Error('Locus tool result is missing');
+    const scope = toolScopes.get(tool_use_id);
+    if (scope && typeof answer.locusOutput === 'string') scope.displayOutput = toolResultDisplay(answer.locusOutput);
     // Registration must settle before returning the result: the engine then
     // appends its deferred-tools delta and handles ToolSearch/tool_reference.
     // Schemas stay in bridge metadata, never in result text or system prompts.
     await registerTools($, answer.toolCatalogDelta, registeredTools, toolPlacements);
-    return { result: answer.result, ...(answer.context ? { context: answer.context } : {}) };
+    return { result: locusTool ? nativeToolContent(answer.result) : answer.result, ...(answer.context ? { context: answer.context } : {}) };
   }).catch(async ($, e, next) => {
     if (next.error?.kind === 're-entry' && ['TaskList','TaskGet'].includes(e.tool)) return next(e);
     // Replay a completed native result, never execute a bridged write again.

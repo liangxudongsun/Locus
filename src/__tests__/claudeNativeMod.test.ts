@@ -545,6 +545,80 @@ describe('Claude native tools Mod', () => {
     expect(h.events().some(e => e.type === 'bridge_fault')).toBe(false);
   });
 
+  it.each([
+    ['Read', true], ['Read', false], ['mcp__locus__read', true], ['mcp__locus__read', false],
+  ] as const)('keeps large %s images out of display receipts without changing native history (local summary=%s)', async (tool, hasSummary) => {
+    const options = { active: true, inputId: 'large-image', prompt: 'Read the cover' };
+    const h = await inputHarness(options);
+    const data = 'A'.repeat(1_918_796); // The failing 1.4 MiB JPEG, after base64 expansion.
+    const image = { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } };
+    const summary = '{"file_path":"cover.jpg","image":"attached","byte_size":1439097}';
+    const result = tool === 'Read'
+      ? { type: 'image', file: { base64: data, type: 'image/jpeg', originalSize: 1_439_097 } }
+      : [image];
+    h.fetch.mockImplementation(async (url, init) => {
+      if (new TextEncoder().encode(init.body).length > 1024 * 1024) {
+        return { ok: false, status: 413, text: '{"error":"Invalid bridge body size"}' };
+      }
+      const body = JSON.parse(init.body);
+      return { ok: true, status: 200, text: JSON.stringify(url.endsWith('/options') ? options
+        : url.endsWith('/call') ? { callId: body.callId, result, ...(hasSummary ? { locusOutput: summary } : {}) }
+        : { ok: true }) };
+    });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'large-image' }, h.next);
+    const nativeTool = vi.fn();
+    const answer = await h.hooks.get('tool.call')!.run(h.api, { tool, tool_use_id: 'image', file_path: 'cover.jpg' }, nativeTool);
+    expect(answer.result).toEqual(result);
+    const content = [{ type: 'text', text: 'Cover image' }, image];
+    const event = { uuid: 'saved-image', door: 'tool', message: { type: 'user', role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'image', content },
+    ] } };
+    const append = vi.fn(async () => ({}));
+    await h.hooks.get('session.append')!.run(h.api, event, append);
+    expect(append).toHaveBeenCalledExactlyOnceWith(event);
+    expect(image.source.data).toBe(data);
+    const receipt = h.events().find(e => e.type === 'tool_result');
+    expect(receipt).toMatchObject({ id: 'image', runId: 'large-image', isError: false });
+    expect(receipt.output).not.toContain(data);
+    if (hasSummary) expect(receipt.output).toBe(summary);
+    else {
+      expect(receipt.output).toContain('Cover image');
+      expect(receipt.output).toContain('image');
+    }
+    expect(h.events().find(e => e.type === 'checkpoint')).toMatchObject({ uuid: 'saved-image', results: ['image'] });
+    const health = (h.api.clock.every.mock.calls.find(call => call[0] === 2000) as unknown as [number, () => Promise<void>])[1];
+    await health();
+    expect(h.events().slice(-1)[0]).toMatchObject({ type: 'bridge_health', state: 'running' });
+    expect(h.fetch.mock.calls.filter(call => call[0].endsWith('/call'))).toHaveLength(1);
+    expect(nativeTool).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('bounds oversized display text and preserves native error verdicts (error=%s)', async (isError) => {
+    const options = { active: true, inputId: 'large-text', prompt: 'Run' };
+    const h = await inputHarness(options);
+    const text = '\u0000\n"\\文😀'.repeat(150_000);
+    h.fetch.mockImplementation(async (url, init) => {
+      if (new TextEncoder().encode(init.body).length > 1024 * 1024) return { ok: false, status: 413, text: '{}' };
+      return { ok: true, status: 200, text: JSON.stringify(url.endsWith('/options') ? options
+        : url.endsWith('/call') ? { callId: 'text', result: 'done', locusOutput: isError ? 'local success' : text }
+        : { ok: true }) };
+    });
+    await h.hooks.get('prompt.submit')!.run(h.api, { text: 'large-text' }, h.next);
+    await h.hooks.get('tool.call')!.run(h.api, { tool: 'Read', tool_use_id: 'text', file_path: 'large.txt' }, vi.fn());
+    const event = { uuid: 'saved-text', door: 'tool', message: { type: 'user', role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'text', content: text, is_error: isError },
+    ] } };
+    const append = vi.fn(async () => ({}));
+    await h.hooks.get('session.append')!.run(h.api, event, append);
+    expect(append).toHaveBeenCalledExactlyOnceWith(event);
+    const receipt = h.events().find(e => e.type === 'tool_result');
+    expect(receipt.isError).toBe(isError);
+    expect(receipt.output.startsWith(text.slice(0, 100))).toBe(true);
+    expect(receipt.output).toContain('truncated');
+    expect(receipt.output.length).toBeLessThan(70_000);
+    expect(h.events().some(e => e.type === 'checkpoint')).toBe(true);
+  });
+
   it('synchronizes the actual native task list without rerunning a mutation', async () => {
     const h=harness({active:true,inputId:'main',prompt:'Tasks'});
     const task={id:'1',subject:'Task A',description:'details',status:'completed',blocks:[],blockedBy:[]};
@@ -935,6 +1009,48 @@ describe('Claude native tools Mod', () => {
     const hook = h.hooks.get('tool.call')!;
     await expect(hook.run(api, { tool: 'mcp__locus__python', tool_use_id: 't1' }, h.next)).rejects.toThrow('SSH disconnected');
     expect(await hook.fail!(api, {}, h.next)).toMatchObject({ deny: expect.stringContaining('no fallback') });
+    expect(h.next).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('converts local MCP images to Claude source blocks before native append (started=%s)', async (started) => {
+    const text = { type: 'text', text: 'Captured Unity viewport' };
+    const images = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].map((mimeType, index) => ({
+      type: 'image', mimeType, data: `image-bytes-${index}`,
+    }));
+    const nativeImage = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'already-native' } };
+    const blocks = [text, ...images, nativeImage, { type: 'text', text: 'After the images' }];
+    const context = ['Background task completed'];
+    // Journal replays use this same bridge envelope; conversion must not depend
+    // on fresh execution or rewrite its stored MCP data / GUI display output.
+    const h = harness({ callId: 't1', result: blocks, context, locusOutput: 'journal display only' });
+    const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' },
+      session: { model: async () => 'claude-opus-5-5', id: async () => 'session' } };
+    if (started) await h.hooks.get('session.start')!.run(api, {}, h.next);
+    h.next.mockClear();
+    for (const tool of ['mcp__locus__unity_capture_viewport', 'mcp__locus__unity_execute', 'mcp__locus__python']) {
+      const answer = await h.hooks.get('tool.call')!.run(api, { tool, tool_use_id: 't1' }, h.next);
+      expect(answer).toEqual({ result: [text, ...images.map(image => ({ type: 'image',
+        source: { type: 'base64', media_type: image.mimeType, data: image.data },
+      })), nativeImage, blocks[blocks.length - 1]], context });
+      expect(answer.result.slice(1, 5).every((block: Record<string, unknown>) => !('mimeType' in block) && !('data' in block))).toBe(true);
+    }
+    expect(images[0]).toEqual({ type: 'image', mimeType: 'image/png', data: 'image-bytes-0' });
+    expect(h.next).not.toHaveBeenCalled();
+  });
+
+  it('converts a polled image receipt without resubmitting the tool', async () => {
+    const h = harness({ callId: 't1', result: [{ type: 'image', mimeType: 'image/png', data: 'saved-image' }] });
+    h.fetch.mockResolvedValueOnce({ ok: true, status: 202, text: JSON.stringify({ pending: 'saved-receipt' }) });
+    expect(await h.hooks.get('tool.call')!.run(h.api, { tool: 'mcp__locus__python', tool_use_id: 't1' }, h.next))
+      .toEqual({ result: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'saved-image' } }] });
+    expect(h.fetch.mock.calls.map(call => new URL(call[0]).pathname)).toEqual(['/call', '/poll']);
+    expect(h.next).not.toHaveBeenCalled();
+  });
+
+  it('keeps native Read image envelopes for Claude own renderer', async () => {
+    const result = { type: 'image', file: { base64: 'native-read', type: 'image/png', originalSize: 8 } };
+    const h = harness({ callId: 't1', result });
+    expect(await h.hooks.get('tool.call')!.run(h.api, { tool: 'Read', tool_use_id: 't1' }, h.next)).toEqual({ result });
     expect(h.next).not.toHaveBeenCalled();
   });
 
