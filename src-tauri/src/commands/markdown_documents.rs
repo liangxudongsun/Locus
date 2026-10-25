@@ -4,10 +4,10 @@ use crate::{
     workspace_service::{ProjectRegistry, WorkspaceRef},
 };
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -152,138 +152,39 @@ pub async fn markdown_rewrite_image_links(
     ))
 }
 
-static RECOVERY_LOCK: Mutex<()> = Mutex::new(());
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DocumentSnapshot {
-    pub text: String,
-    pub at: i64,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DocumentRecovery {
-    pub schema_version: u32,
-    #[serde(default)]
-    pub key: String,
-    pub base: String,
-    pub draft: Option<DocumentSnapshot>,
-    pub snapshots: Vec<DocumentSnapshot>,
-}
-impl Default for DocumentRecovery {
-    fn default() -> Self {
-        Self {
-            schema_version: 1,
-            key: String::new(),
-            base: String::new(),
-            draft: None,
-            snapshots: Vec::new(),
-        }
-    }
-}
-fn recovery_path(app: &AppHandle, key: &str) -> Result<PathBuf, AppError> {
-    let root = crate::runtime_paths::runtime_config_dir_from_env()
+use crate::document_recovery::{
+    DocumentRecoveryStore, RecoveryRead, RecoveryUpdate, RecoveryUpdateResult,
+};
+
+async fn with_recovery<T: Send + 'static>(
+    store: Arc<DocumentRecoveryStore>,
+    work: impl FnOnce(&DocumentRecoveryStore) -> Result<T, String> + Send + 'static,
+) -> Result<T, AppError> {
+    tauri::async_runtime::spawn_blocking(move || work(&store))
+        .await
         .map_err(error)?
-        .unwrap_or(app.path().app_data_dir().map_err(error)?);
-    Ok(root
-        .join("document-recovery")
-        .join(format!("{}.json", blake3::hash(key.as_bytes()).to_hex())))
+        .map_err(error)
 }
-fn read_recovery(path: &Path) -> Result<DocumentRecovery, AppError> {
-    if !path.exists() {
-        return Ok(DocumentRecovery::default());
-    }
-    let record: DocumentRecovery =
-        serde_json::from_slice(&std::fs::read(path).map_err(error)?).map_err(error)?;
-    if record.schema_version != 1 {
-        return Err(error("Unsupported document recovery version"));
-    }
-    Ok(record)
-}
+
 #[tauri::command]
 pub async fn markdown_recovery_read(
     key: String,
     include_history: Option<bool>,
-    app: AppHandle,
-) -> Result<DocumentRecovery, AppError> {
-    let _guard = RECOVERY_LOCK.lock().map_err(error)?;
-    let path = recovery_path(&app, &key)?;
-    let mut record = read_recovery(&path)?;
-    if include_history.unwrap_or(false) && path.with_extension("history.json").exists() {
-        let history = read_recovery(&path.with_extension("history.json"))?;
-        record.snapshots = history.snapshots;
-    } else {
-        record.snapshots.clear();
-    }
-    Ok(record)
-}
-#[tauri::command]
-pub async fn markdown_recovery_write(
-    key: String,
-    base: String,
-    text: String,
-    saved: bool,
-    app: AppHandle,
-) -> Result<(), AppError> {
-    if text.len() > 2 * 1024 * 1024 || base.len() > 2 * 1024 * 1024 {
-        return Err(error("Document recovery exceeds 2 MiB"));
-    }
-    let _guard = RECOVERY_LOCK.lock().map_err(error)?;
-    let path = recovery_path(&app, &key)?;
-    let mut record = read_recovery(&path)?;
-    record.key = key;
-    let history_path = path.with_extension("history.json");
-    if saved && history_path.exists() {
-        record.snapshots = read_recovery(&history_path)?.snapshots;
-    }
-    let previous_snapshot = record.snapshots.last().map(|s| s.text.clone());
-    update_recovery(&mut record, base, text, saved);
-    std::fs::create_dir_all(path.parent().unwrap()).map_err(error)?;
-    if saved && previous_snapshot.as_deref() != Some(record.base.as_str()) {
-        let history = DocumentRecovery {
-            snapshots: record.snapshots.clone(),
-            key: record.key.clone(),
-            ..DocumentRecovery::default()
-        };
-        crate::config::atomic_write_config(
-            &history_path,
-            &serde_json::to_vec(&history).map_err(error)?,
-        )
-        .map_err(error)?;
-    }
-    record.snapshots.clear();
-    crate::config::atomic_write_config(&path, &serde_json::to_vec(&record).map_err(error)?)
-        .map_err(error)?;
-    Ok(())
+    store: State<'_, Arc<DocumentRecoveryStore>>,
+) -> Result<RecoveryRead, AppError> {
+    let include_history = include_history.unwrap_or(false);
+    with_recovery(store.inner().clone(), move |store| {
+        store.read(&key, include_history)
+    })
+    .await
 }
 
-fn update_recovery(record: &mut DocumentRecovery, base: String, text: String, saved: bool) {
-    let now = chrono::Utc::now().timestamp_millis();
-    if record.snapshots.is_empty() {
-        record.snapshots.push(DocumentSnapshot {
-            text: base.clone(),
-            at: now,
-        });
-    }
-    if saved {
-        if record.snapshots.last().is_none_or(|s| s.text != text) {
-            let at = now.max(record.snapshots.last().map_or(now, |s| s.at + 1));
-            record.snapshots.push(DocumentSnapshot {
-                text: text.clone(),
-                at,
-            });
-        }
-        if record.snapshots.len() > 20 {
-            record.snapshots.remove(0);
-        }
-        // A late acknowledgement from another view must not erase a newer draft.
-        if record.draft.as_ref().is_some_and(|d| d.text == text) {
-            record.draft = None;
-        }
-        record.base = text;
-    } else {
-        record.base = base.clone();
-        record.draft = (text != base).then_some(DocumentSnapshot { text, at: now });
-    }
+#[tauri::command]
+pub async fn markdown_recovery_update(
+    request: RecoveryUpdate,
+    store: State<'_, Arc<DocumentRecoveryStore>>,
+) -> Result<RecoveryUpdateResult, AppError> {
+    with_recovery(store.inner().clone(), move |store| store.update(request)).await
 }
 
 pub(crate) fn recovery_image_updates(
@@ -293,96 +194,28 @@ pub(crate) fn recovery_image_updates(
     old: &Path,
     new: &Path,
 ) -> Result<Vec<attachments::ReferenceUpdate>, AppError> {
-    let _guard = RECOVERY_LOCK.lock().map_err(error)?;
-    let directory = recovery_path(app, "")?.parent().unwrap().to_path_buf();
-    if !directory.exists() {
+    let Some(store) = app.try_state::<Arc<DocumentRecoveryStore>>() else {
         return Ok(Vec::new());
-    }
-    let mut updates = Vec::new();
-    for entry in std::fs::read_dir(directory).map_err(error)? {
-        let path = entry.map_err(error)?.path();
-        if path.extension().is_none_or(|ext| ext != "json") {
-            continue;
-        }
-        let before = std::fs::read_to_string(&path).map_err(error)?;
-        let mut record: DocumentRecovery = serde_json::from_str(&before).map_err(error)?;
-        let Ok(key) = serde_json::from_str::<Vec<serde_json::Value>>(&record.key) else {
-            continue;
-        };
-        if checkout.is_none() || key.first().and_then(|v| v.as_str()) != checkout {
-            continue;
-        }
-        let Some(content_path) = key.get(2).and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let document = root.join(content_path);
-        let rewrite =
-            |text: &str| attachments::rewrite_image_links(text, root, &document, old, new);
-        record.base = rewrite(&record.base);
-        if let Some(draft) = &mut record.draft {
-            draft.text = rewrite(&draft.text);
-        }
-        for snapshot in &mut record.snapshots {
-            snapshot.text = rewrite(&snapshot.text);
-        }
-        let after = serde_json::to_string(&record).map_err(error)?;
-        if after != before {
-            updates.push(attachments::ReferenceUpdate {
-                path,
-                before,
-                after,
-            });
-        }
-    }
-    Ok(updates)
+    };
+    let rewrites = store
+        .image_rewrites(checkout, |content_path, text| {
+            let document = root.join(content_path);
+            attachments::rewrite_image_links(text, root, &document, old, new)
+        })
+        .map_err(error)?;
+    Ok(rewrites
+        .into_iter()
+        .map(|rewrite| attachments::ReferenceUpdate {
+            path: rewrite.path,
+            before: rewrite.before,
+            after: rewrite.after,
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn acknowledges_saved_text_without_losing_newer_drafts() {
-        let mut record = DocumentRecovery::default();
-        update_recovery(
-            &mut record,
-            "base".into(),
-            "submitted and continued".into(),
-            false,
-        );
-        update_recovery(&mut record, "base".into(), "submitted".into(), true);
-        assert_eq!(
-            record.draft.as_ref().unwrap().text,
-            "submitted and continued"
-        );
-        update_recovery(
-            &mut record,
-            "submitted".into(),
-            "submitted and continued".into(),
-            true,
-        );
-        assert!(record.draft.is_none());
-        assert_eq!(record.snapshots[0].text, "base");
-        assert_eq!(
-            record.snapshots.last().unwrap().text,
-            "submitted and continued"
-        );
-    }
-    #[test]
-    fn bounds_history_and_preserves_explicit_schema() {
-        let mut record = DocumentRecovery::default();
-        for i in 0..30 {
-            update_recovery(&mut record, "base".into(), format!("version {i}"), true);
-        }
-        assert_eq!(record.snapshots.len(), 20);
-        assert_eq!(record.schema_version, 1);
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("recovery.json");
-        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-        assert_eq!(read_recovery(&path).unwrap().snapshots.len(), 20);
-        record.schema_version = 999;
-        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-        assert!(read_recovery(&path).is_err());
-    }
     #[test]
     fn document_import_is_scoped_to_workspace() {
         let root = tempfile::tempdir().unwrap();
