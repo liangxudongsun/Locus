@@ -54,6 +54,27 @@ impl ClaudeCodeHost for IdleHost {
     }
 }
 
+const MAX_SPARE_STARTUPS: usize = 2;
+const HISTORY_GATE_TIMEOUT: Duration = Duration::from_secs(90);
+
+async fn startup_gate(id: &str, timeout: Duration) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
+    tokio::time::timeout(timeout, history_gate(id).write_owned()).await
+        .map_err(|_| format!("History lock: timed out after {}s waiting for the current turn or history operation; no SSH connection was started", timeout.as_secs()))
+}
+
+fn startup_result(id: &str, result: Result<(), String>) -> Result<(), String> {
+    result.map_err(|error| super::super::turn_retry::with_context(&format!("Claude prewarm session={id}"), error))
+}
+
+// Startup owns the history-lock, SSH/environment and TUI deadlines. A second
+// blanket deadline here would hide the failing stage (and cancel authorized
+// environment setup before its own timeout can report useful diagnostics).
+async fn wait_job(mut receive: tokio::sync::watch::Receiver<bool>) {
+    while !*receive.borrow_and_update() {
+        if receive.changed().await.is_err() { break; }
+    }
+}
+
 fn launch(state: &mut Pool, options: ClaudeCodeCliOptions, permission: PermissionMode) {
     let id = options.locus_session_id.clone();
     if state.jobs.contains_key(&id) { return; }
@@ -63,8 +84,9 @@ fn launch(state: &mut Pool, options: ClaudeCodeCliOptions, permission: Permissio
     let generation = uuid::Uuid::new_v4().to_string();
     let job_generation = generation.clone();
     let task = tokio::spawn(async move {
-        let result = tokio::time::timeout(Duration::from_secs(90), async {
-            let _gate = history_gate(&job_id).write_owned().await;
+        eprintln!("[Claude] prewarm started: session={job_id}");
+        let result = async {
+            let _gate = startup_gate(&job_id, HISTORY_GATE_TIMEOUT).await?;
             let existing = sessions().lock().unwrap_or_else(|e| e.into_inner()).get(&job_id).cloned();
             if let Some(existing) = existing {
                 if existing.alive() && existing.cwd == options.cwd && existing.connection == options.remote
@@ -90,13 +112,12 @@ fn launch(state: &mut Pool, options: ClaudeCodeCliOptions, permission: Permissio
             }
             lease.1 = true;
             Ok::<_, String>(())
-        }).await;
+        }.await;
+        let result = startup_result(&job_id, result);
+        if result.is_ok() { eprintln!("[Claude] prewarm ready: session={job_id}"); }
         let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
         if state.jobs.get(&job_id).is_some_and(|job| job.generation == job_generation) {
-            record_result(&mut state, context.as_ref(), match result {
-                Ok(result) => result,
-                Err(_) => Err("Claude connection timed out".to_string()),
-            });
+            record_result(&mut state, context.as_ref(), result);
             state.jobs.remove(&job_id);
         }
         let _ = done.send(true);
@@ -152,7 +173,7 @@ pub(crate) async fn connect(context: Context) -> Result<(), String> {
         state.retry_after = None;
     }
     maintain(context.clone(), None, true);
-    reconcile_inner(true);
+    reconcile();
     let (id, receive) = {
         let state = pool().lock().unwrap_or_else(|e| e.into_inner());
         let id = state.spares.iter().find(|spare| spare.context == context)
@@ -160,13 +181,7 @@ pub(crate) async fn connect(context: Context) -> Result<(), String> {
         let receive = state.jobs.get(&id).map(|job| job.done.clone());
         (id, receive)
     };
-    if let Some(mut receive) = receive {
-        tokio::time::timeout(Duration::from_secs(95), async {
-            while !*receive.borrow_and_update() {
-                if receive.changed().await.is_err() { break; }
-            }
-        }).await.map_err(|_| "Claude connection timed out")?;
-    }
+    if let Some(receive) = receive { wait_job(receive).await; }
     if sessions().lock().unwrap_or_else(|e| e.into_inner()).get(&id)
         .is_some_and(|session| session.alive() && session.ready.load(Ordering::SeqCst)) {
         Ok(())
@@ -176,11 +191,16 @@ pub(crate) async fn connect(context: Context) -> Result<(), String> {
     }
 }
 
-fn reconcile() {
-    reconcile_inner(false);
+// Used conversations have independent lifetimes. Only pending startups count
+// against replenishment concurrency; a long-running turn must never starve the
+// spare pool. Bound-session warmups also consume startup slots while pending.
+fn replenishment_count(state: &Pool, capacity: usize, now: Instant) -> usize {
+    if state.retry_after.is_some_and(|at| now < at) { return 0; }
+    capacity.saturating_sub(state.spares.len())
+        .min(MAX_SPARE_STARTUPS.saturating_sub(state.jobs.len()))
 }
 
-fn reconcile_inner(explicit: bool) {
+fn reconcile() {
     let Ok(settings) = super::super::ssh::load_settings() else { return; };
     let snapshot = sessions().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
@@ -206,13 +226,10 @@ fn reconcile_inner(explicit: bool) {
         if let Some(session) = snapshot.get(&spare.id) { *session.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now(); }
     }
     if let Some(context) = desired {
-        let busy = snapshot.values().any(|s| s.remote.is_some() && s.busy.load(Ordering::SeqCst));
-        if (explicit || !busy) && state.retry_after.is_none_or(|at| Instant::now() >= at) {
-            while state.spares.len() < capacity {
-                let id = uuid::Uuid::new_v4().to_string();
-                state.spares.push(Spare { id: id.clone(), context: context.clone() });
-                launch(&mut state, context.options(id, None), context.permission);
-            }
+        for _ in 0..replenishment_count(&state, capacity, Instant::now()) {
+            let id = uuid::Uuid::new_v4().to_string();
+            state.spares.push(Spare { id: id.clone(), context: context.clone() });
+            launch(&mut state, context.options(id, None), context.permission);
         }
     }
     drop(state);
@@ -242,11 +259,7 @@ pub(crate) async fn wait_for(id: &str) -> Result<(), String> {
         let mut state = pool().lock().unwrap_or_else(|e| e.into_inner());
         state.jobs.get_mut(id).map(|job| { job.claimed = true; job.done.clone() })
     };
-    if let Some(mut receive) = receive {
-        tokio::time::timeout(Duration::from_secs(90), async {
-            while !*receive.borrow_and_update() { if receive.changed().await.is_err() { break; } }
-        }).await.map_err(|_| "Claude prewarm is still waiting for SSH; retry when it is ready".to_string())?;
-    }
+    if let Some(receive) = receive { wait_job(receive).await; }
     Ok(())
 }
 pub(super) async fn turn_gate(id: &str) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
@@ -339,6 +352,73 @@ mod tests {
         assert!(state.retry_after.is_none());
         assert!(pool_snapshot(&state, &context.remote, &settings).last_error.is_none());
     }
+    #[tokio::test]
+    async fn replenishment_is_bounded_by_startup_jobs_not_conversation_lifetimes() {
+        let context = context();
+        let now = Instant::now();
+        let mut state = Pool::default();
+        assert_eq!(replenishment_count(&state, 4, now), 2);
+        assert_eq!(replenishment_count(&state, 1, now), 1);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let (_send, done) = tokio::sync::watch::channel(false);
+        for id in ["claimed-by-running-turn", "bound-session-startup"] {
+            state.jobs.insert(id.into(), Job { generation: id.into(), abort: task.abort_handle(), done: done.clone(), claimed: true });
+        }
+        assert_eq!(replenishment_count(&state, 4, now), 0);
+        // Once startup finishes, a claimed process may stay busy for hours.
+        // It no longer occupies a startup slot or blocks replacement spares.
+        state.jobs.remove("claimed-by-running-turn");
+        assert_eq!(replenishment_count(&state, 4, now), 1);
+        state.jobs.clear();
+        for id in ["one", "two", "three"] {
+            state.spares.push(Spare { id: id.into(), context: context.clone() });
+        }
+        assert_eq!(replenishment_count(&state, 4, now), 1);
+        assert_eq!(replenishment_count(&state, 2, now), 0);
+        state.retry_after = Some(now + Duration::from_secs(60));
+        assert_eq!(replenishment_count(&state, 4, now), 0);
+        assert_eq!(replenishment_count(&state, 4, now + Duration::from_secs(60)), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn lock_timeout_names_the_session_and_stage_without_claiming_ssh_failed() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let guard = history_gate(&id).write_owned().await;
+        let result = startup_gate(&id, Duration::from_millis(1)).await.map(|_| ());
+        let error = startup_result(&id, result).unwrap_err();
+        assert!(error.contains(&id) && error.contains("History lock"));
+        assert!(error.contains("no SSH connection was started"));
+        assert!(!super::super::super::turn_retry::is_disconnected(&error));
+        drop(guard);
+        assert!(startup_gate(&id, Duration::from_secs(1)).await.is_ok());
+    }
+
+    #[test]
+    fn prewarm_diagnostics_preserve_startup_stage_and_transport_classification() {
+        use super::super::super::turn_retry;
+        for stage in ["SSH connection", "Environment preparation", "TUI initialization"] {
+            let error = startup_result("session-id", Err(format!("{stage}: timed out"))).unwrap_err();
+            assert!(error.contains("session-id") && error.contains(stage));
+            assert!(!turn_retry::is_disconnected(&error));
+        }
+        let error = startup_result("session-id", Err(turn_retry::disconnected("SSH connection: timed out"))).unwrap_err();
+        assert!(turn_retry::is_disconnected(&error));
+        assert!(error.contains("session-id") && error.contains("SSH connection"));
+    }
+
+    #[tokio::test]
+    async fn job_waiters_follow_the_startup_result_and_do_not_hang_on_cancellation() {
+        let (done, receive) = tokio::sync::watch::channel(false);
+        let mut waiting = Box::pin(wait_job(receive));
+        assert!(tokio::time::timeout(Duration::from_millis(1), &mut waiting).await.is_err());
+        done.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap();
+        let (done, receive) = tokio::sync::watch::channel(false);
+        drop(done);
+        tokio::time::timeout(Duration::from_secs(1), wait_job(receive)).await.unwrap();
+    }
+
     #[test]
     fn allocation_is_exclusive_and_never_crosses_server_model_or_checkout() {
         let context = context();

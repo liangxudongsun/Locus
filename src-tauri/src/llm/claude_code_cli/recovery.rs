@@ -318,7 +318,7 @@ async fn synchronize_inner(store: &SessionStore, id: &str, pending: Option<&str>
         }.await;
         // A corrupt local archive/cache must not prevent reading the source server.
         match archived { Ok(snapshot)=>Ok(snapshot), Err(_)=>fetch(id,&remote,native.as_deref()).await }
-    }).await
+    }).await.map_err(|error| super::turn_retry::with_context("History synchronization", error))
 }
 
 pub(crate) async fn synchronize_with_fetch<F, Fut>(

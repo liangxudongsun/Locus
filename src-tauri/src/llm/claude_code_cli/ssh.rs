@@ -14,6 +14,8 @@ use zeroize::Zeroizing;
 pub(crate) mod unlock;
 mod archive_rpc;
 mod heartbeat;
+pub(crate) mod diagnostics;
+pub(super) mod startup;
 
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 const PYTHON: &str = "exec python3 -u -c 'import base64,sys;exec(compile(base64.b64decode(sys.stdin.buffer.readline()),\"<locus-ssh>\",\"exec\"))'";
@@ -273,7 +275,19 @@ pub fn session_key(id: &str, remote: &SshConfig) -> String {
     .to_string()
 }
 
+pub(super) fn configured_command(config: &SshConfig) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("ssh");
+    command.args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+        "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+        "-o", "ClearAllForwardings=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+    if let Some(port) = config.port { command.args(["-p", &port.to_string()]); }
+    if let Some(path) = &config.identity_file { command.args(["-i", path]); }
+    if let Some(path) = &config.known_hosts_file { command.args(["-o", &format!("UserKnownHostsFile={path}")]); }
+    command
+}
+
 pub struct Transport {
+    trace: Arc<diagnostics::Trace>,
     #[cfg(windows)]
     job: super::pty_job::PtyJob,
     child: Mutex<tokio::process::Child>,
@@ -287,12 +301,32 @@ pub struct Transport {
 }
 impl Transport {
     pub fn failure(&self) -> String {
-        self.failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
-            .unwrap_or_else(|| super::turn_retry::disconnected("SSH connection closed"))
+        let status = self.child.lock().unwrap_or_else(|e| e.into_inner()).try_wait().ok().flatten();
+        let error = self.failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .unwrap_or_else(|| super::turn_retry::disconnected("SSH connection closed"));
+        // The child watcher can observe exit before the reader gets scheduled.
+        // Capture that failure too; intentional stop sets trace.stopped first.
+        if status.is_some() || !self.healthy.load(Ordering::SeqCst) {
+            self.trace.fail("closed", &error, status.and_then(|s| s.code()));
+        }
+        self.trace.observe_exit(status.and_then(|s| s.code()));
+        error
     }
     pub fn latency_ms(&self) -> Option<f64> {
         if !self.alive() { return None; }
         self.heartbeat.lock().unwrap_or_else(|e| e.into_inner()).latency_ms(std::time::Instant::now())
+    }
+    /// Called when the hooks lease expires, not during environment bootstrap.
+    /// A live SSH child or missing RTT is insufficient evidence either way.
+    pub(super) fn health_failure(&self) -> Option<String> {
+        if !self.alive() { return Some(self.failure()); }
+        let unresponsive = self.heartbeat.lock().unwrap_or_else(|e| e.into_inner())
+            .unresponsive(std::time::Instant::now());
+        unresponsive.then(|| {
+            let error = super::turn_retry::disconnected("SSH transport heartbeat received no response for 30s");
+            self.trace.fail("heartbeat", &error, None);
+            error
+        })
     }
     pub fn alive(&self) -> bool {
         self.healthy.load(Ordering::SeqCst)
@@ -305,6 +339,7 @@ impl Transport {
             )
     }
     pub fn stop(&self) {
+        if self.trace.stopped.swap(true, Ordering::Relaxed) { return; }
         self.archive_rpc.close(&self.failure());
         self.healthy.store(false, Ordering::SeqCst);
         let _ = self.send.try_send(json!({"type":"close"}));
@@ -317,7 +352,20 @@ impl Transport {
             .start_kill();
         // A stopped Session can remain in the cache until its next turn. Do not
         // retain its writer/reader tasks (or pending tool futures) until Drop.
-        for task in &self.tasks {
+        for (index, task) in self.tasks.iter().enumerate() {
+            // On real failure only, drain already-written SSH stderr briefly.
+            // Recovery and process termination do not wait for this, and all
+            // tool/read/write/heartbeat tasks are still retired immediately.
+            if index == 2 && self.trace.has_failed() {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let abort = task.abort_handle();
+                    runtime.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        abort.abort();
+                    });
+                    continue;
+                }
+            }
             task.abort();
         }
     }
@@ -360,37 +408,17 @@ impl Transport {
         request["cliPath"] = json!(config.cli_path);
         request["keychainUnlock"] = json!(true);
         let authorized = request["authorizedSetup"] == true;
-        let mut command = tokio::process::Command::new("ssh");
-        command.args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ConnectTimeout=15",
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=2",
-            "-o",
-            "ClearAllForwardings=yes",
-            "-o",
-            "ControlMaster=no",
-            "-o",
-            "ControlPath=none",
-        ]);
-        if let Some(port) = config.port {
-            command.args(["-p", &port.to_string()]);
-        }
-        if let Some(path) = &config.identity_file {
-            command.args(["-i", path]);
-        }
-        if let Some(path) = &config.known_hosts_file {
-            command.args(["-o", &format!("UserKnownHostsFile={path}")]);
-        }
+        let handshake = Arc::new(Mutex::new(startup::Handshake::new(&request)));
+        let heartbeat = Arc::new(Mutex::new(heartbeat::Heartbeat::default()));
+        let trace = diagnostics::Trace::new(config, &request, heartbeat.clone());
+        let mut command = configured_command(config);
+        // The remote shell reaching this marker proves SSH connected, including
+        // when Python installation/bootstrap has not reached the helper yet.
+        let bootstrap_stage = if matches!(request["mode"].as_str(), Some("history" | "archive")) {
+            "history"
+        } else { "environment" };
         command.arg("--").arg(&config.target).arg(format!(
-            "{}{}",
+            "printf '%s\\n' '{{\"type\":\"progress\",\"protocol\":1,\"stage\":\"{bootstrap_stage}\",\"source\":\"shell\"}}'; {}{}",
             if authorized {
                 INSTALL_PYTHON
             } else {
@@ -405,9 +433,13 @@ impl Transport {
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(super::CREATE_NO_WINDOW);
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("Could not start OpenSSH: {e}"))?;
+        let mut child = command.spawn().map_err(|e| {
+            let error = handshake.lock().unwrap_or_else(|e| e.into_inner())
+                .context(format!("Could not start OpenSSH: {e}"));
+            trace.fail("spawn", &error, None);
+            error
+        })?;
+        if let Some(pid) = child.id() { trace.pid(pid); }
         #[cfg(windows)]
         let job = super::pty_job::PtyJob::attach(child.id().ok_or("SSH process ID unavailable")?)?;
         let mut stdin = child.stdin.take().ok_or("SSH stdin unavailable")?;
@@ -421,25 +453,28 @@ impl Transport {
         let failure = Arc::new(Mutex::new(None));
         let diagnostic = Arc::new(Mutex::new(Vec::new()));
         let error_buffer = diagnostic.clone();
+        let stderr_trace = trace.clone();
         let stderr_task = tokio::spawn(async move {
             let mut bytes = [0; 8192];
             while let Ok(count) = stderr.read(&mut bytes).await {
                 if count == 0 {
                     break;
                 }
+                stderr_trace.stderr(&bytes[..count]);
                 append_diagnostic(&error_buffer, &bytes[..count]);
             }
         });
         let writer_health = healthy.clone();
         let writer_failure = failure.clone();
-        let heartbeat = Arc::new(Mutex::new(heartbeat::Heartbeat::default()));
+        let writer_trace = trace.clone();
         let writer_heartbeat = heartbeat.clone();
         let source = base64::engine::general_purpose::STANDARD.encode(include_str!("ssh_host.py"));
         let write_task = tokio::spawn(async move {
             let run = async {
-                stdin
-                    .write_all(format!("{source}\n{request}\n").as_bytes())
-                    .await?;
+                let bootstrap = format!("{source}\n{request}\n");
+                stdin.write_all(bootstrap.as_bytes()).await?;
+                writer_trace.sent(bootstrap.len());
+                drop(bootstrap);
                 stdin.flush().await?;
                 loop {
                     let bytes = tokio::select! {
@@ -465,13 +500,15 @@ impl Transport {
                     }
                     stdin.write_all(&bytes).await?;
                     stdin.write_all(b"\n").await?;
+                    writer_trace.sent(bytes.len() + 1);
                     stdin.flush().await?;
                 }
                 Ok::<_, std::io::Error>(())
             };
             if let Err(error) = run.await {
-                writer_failure.lock().unwrap_or_else(|e| e.into_inner())
-                    .get_or_insert_with(|| super::turn_retry::disconnected(format!("SSH write failed: {error}")));
+                let error = super::turn_retry::disconnected(format!("SSH write failed: {error}"));
+                writer_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(error.clone());
+                if writer_trace.unexpected_end() { writer_trace.fail("write", &error, None); }
             }
             writer_health.store(false, Ordering::SeqCst);
         });
@@ -483,6 +520,8 @@ impl Transport {
         let archive_rpc=Arc::new(archive_rpc::ArchiveRpc::default());
         let read_archive_rpc=archive_rpc.clone();
         let read_heartbeat = heartbeat.clone();
+        let read_handshake = handshake.clone();
+        let read_trace = trace.clone();
         let read_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut hello = Some(hello_send);
@@ -492,7 +531,7 @@ impl Transport {
                 while pending.try_join_next().is_some() {}
                 // Reading a frame is deliberately not raced against completed
                 // replies: cancelling a partial read would discard its prefix.
-                let value = match read_frame(&mut reader).await {
+                let value = match read_frame_traced(&mut reader, Some(&read_trace)).await {
                     Ok(Some(value)) => value,
                     result => {
                         let error = result.err().unwrap_or_else(|| super::turn_retry::disconnected("SSH output closed"));
@@ -518,10 +557,9 @@ impl Transport {
                     }
                     Some("hello") if value["protocol"] == 1 => {
                         if let Some(hello) = hello.take() {
-                            let _ = hello.send(
-                                serde_json::from_value::<RemoteInfo>(value["info"].clone())
-                                    .map_err(|e| e.to_string()),
-                            );
+                            let info = serde_json::from_value::<RemoteInfo>(value["info"].clone()).map_err(|e| e.to_string());
+                            if info.is_ok() { read_trace.ready(); }
+                            let _ = hello.send(info);
                         }
                     }
                     Some("terminal") => {
@@ -603,7 +641,10 @@ impl Transport {
                             read_heartbeat.lock().unwrap_or_else(|e| e.into_inner()).received(id, std::time::Instant::now());
                         }
                     }
-                    Some("progress") => {}
+                    Some("progress") => {
+                        read_trace.progress(&value);
+                        read_handshake.lock().unwrap_or_else(|e| e.into_inner()).progress(&value);
+                    }
                     _ => {
                         read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert("Unexpected SSH protocol frame".into());
                         break;
@@ -614,6 +655,7 @@ impl Transport {
             let error = read_failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
                 .unwrap_or_else(|| super::turn_retry::disconnected("SSH reader stopped"));
             if calls.is_some() { eprintln!("[Claude] transport ended: {error}"); }
+            if read_trace.unexpected_end() { read_trace.fail("closed", &error, None); }
             read_archive_rpc.close(&error);
         });
         let heartbeat_health = healthy.clone();
@@ -629,6 +671,7 @@ impl Transport {
             }
         });
         let mut transport = Self {
+            trace,
             archive_rpc,
             heartbeat,
             #[cfg(windows)]
@@ -640,26 +683,28 @@ impl Transport {
             diagnostic,
             failure,
         };
-        let info = match tokio::time::timeout(
-            Duration::from_secs(if authorized { 660 } else { 45 }),
-            hello_receive,
-        )
-        .await
-        {
-            Ok(Ok(result)) => result?,
-            _ => {
+        let timeout = Duration::from_secs(if authorized { 660 } else { 45 });
+        let info = match tokio::time::timeout(timeout, hello_receive).await {
+            Ok(Ok(result)) => match result {
+                Ok(info) => info,
+                Err(error) => {
+                    let error = handshake.lock().unwrap_or_else(|e| e.into_inner()).context(error);
+                    transport.trace.fail("remote", &error, None);
+                    return Err(error);
+                }
+            },
+            result => {
                 // stdout EOF can precede delivery of OpenSSH's stderr verdict.
                 // Drain it briefly so permission/host-key failures are not
                 // mislabeled as an unexplained bridge closure.
                 let _ = tokio::time::timeout(Duration::from_millis(200), &mut transport.tasks[2]).await;
                 let diagnostic = transport.diagnostic.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let error = if diagnostic.is_empty() {
-                    transport.failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
-                        .unwrap_or_else(|| "SSH environment check timed out".into())
-                } else {
-                    format!("SSH environment check failed: {}", String::from_utf8_lossy(&diagnostic))
-                };
-                return Err(super::turn_retry::ssh_startup_error(error));
+                let failure = transport.failure.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let error = handshake.lock().unwrap_or_else(|e| e.into_inner())
+                    .failed(result.is_err(), timeout, failure, &diagnostic);
+                let exit_code = transport.child.lock().unwrap_or_else(|e| e.into_inner()).try_wait().ok().flatten().and_then(|s| s.code());
+                transport.trace.fail(if result.is_err() { "timeout" } else { "closed" }, &error, exit_code);
+                return Err(error);
             }
         };
         Ok((transport, info))
@@ -691,8 +736,15 @@ fn append_diagnostic(buffer: &Mutex<Vec<u8>>, bytes: &[u8]) {
         buffer.drain(..excess);
     }
 }
+#[cfg(test)]
 async fn read_frame(
     reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+) -> Result<Option<Value>, String> {
+    read_frame_traced(reader, None).await
+}
+async fn read_frame_traced(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    trace: Option<&diagnostics::Trace>,
 ) -> Result<Option<Value>, String> {
     let mut bytes = Vec::new();
     loop {
@@ -715,7 +767,9 @@ async fn read_frame(
         let complete = available[count - 1] == b'\n';
         bytes.extend_from_slice(&available[..count]);
         reader.consume(count);
+        if let Some(trace) = trace { trace.received(count, bytes.len()); }
         if complete {
+            if let Some(trace) = trace { trace.frame_complete(); }
             return serde_json::from_slice(&bytes)
                 .map(Some)
                 .map_err(|e| e.to_string());
@@ -808,6 +862,20 @@ mod tests {
         );
         std::fs::write(&new, r#"{"version":2,"remote":null}"#).unwrap();
         assert!(resolve_binding(&new, false, || Ok(None)).is_err());
+    }
+    #[tokio::test]
+    async fn partial_history_bytes_remain_observable_before_a_frame_completes() {
+        let trace = diagnostics::Trace::new(&config(), &json!({"mode":"history"}), Arc::new(Mutex::new(heartbeat::Heartbeat::default())));
+        trace.progress(&json!({"type":"progress","protocol":1,"stage":"history_transfer","bytes":1000}));
+        let (mut writer, reader) = tokio::io::duplex(128);
+        writer.write_all(b"{\"info\":").await.unwrap();
+        let mut reader = BufReader::new(reader);
+        assert!(tokio::time::timeout(Duration::from_millis(10), read_frame_traced(&mut reader, Some(&trace))).await.is_err());
+        let status = trace.snapshot();
+        assert_eq!(status.partial_frame_bytes, 8);
+        assert_eq!(status.received_bytes, 8);
+        assert_eq!(status.expected_frame_bytes, Some(1000));
+        assert!(status.last_receive_age_ms.is_some());
     }
     #[tokio::test]
     async fn frames_reject_truncation_and_invalid_json() {

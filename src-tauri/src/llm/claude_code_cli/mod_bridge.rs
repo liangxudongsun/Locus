@@ -22,8 +22,13 @@ impl ControlSignals {
     pub fn begin_turn(&self, id: &str) {
         self.health.lock().unwrap_or_else(|e| e.into_inner()).begin_turn(id, std::time::Instant::now());
     }
+    #[cfg(test)]
     pub fn health_error(&self, id: &str) -> Option<String> {
-        self.health.lock().unwrap_or_else(|e| e.into_inner()).error(id, std::time::Instant::now())
+        self.health_error_with_transport(id, None)
+    }
+    pub fn health_error_with_transport(&self, id: &str, transport_failure: Option<&str>) -> Option<String> {
+        self.health.lock().unwrap_or_else(|e| e.into_inner())
+            .error_with_transport(id, std::time::Instant::now(), transport_failure)
     }
     pub fn route(&self, payload:&Value, options:&Arc<std::sync::RwLock<Value>>) -> Option<Value> {
         if payload["ready"] == true {

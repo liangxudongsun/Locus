@@ -135,7 +135,11 @@ fn watch_remote_session(id: String, session: &Arc<Session>) {
             // so reaping cannot race a new turn or interrupt a pending tool.
             let Ok(_guard) = history_gate(&id).try_write_owned() else { continue; };
             let idle = remote_idle_expired(*session.last_used.lock().unwrap_or_else(|e| e.into_inner()), Instant::now());
-            if !session.alive() || idle {
+            let alive = session.alive();
+            if !alive {
+                if let Some(remote) = &session.remote { let _ = remote.failure(); }
+            }
+            if !alive || idle {
                 remove_cached_session(&id, &session);
                 break;
             }
@@ -309,7 +313,8 @@ async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::Perm
     .map_err(|e| e.to_string())?;
     std::fs::write(plugin.join("hooks/register.js"), native_mod_source())
         .map_err(|e| e.to_string())?;
-    startup_diagnostics::validate_plugin(&cli, &plugin, &child_env).await?;
+    startup_diagnostics::validate_plugin(&cli, &plugin, &child_env).await
+        .map_err(|error| super::turn_retry::with_context("Environment preparation", error))?;
     let bridge = mod_bridge::ModBridge::start().await?;
     *bridge.options.write().unwrap_or_else(|e| e.into_inner()) =
         json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":tool_catalog.active_tools()});
@@ -366,7 +371,7 @@ async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::Perm
     let mut child = pair
         .slave
         .spawn_command(command)
-        .map_err(|e| format!("Failed to start Claude TUI: {e}"))?;
+        .map_err(|e| format!("TUI initialization: Failed to start Claude TUI: {e}"))?;
     #[cfg(windows)]
     let job = match child
         .process_id()
@@ -453,10 +458,9 @@ async fn start_remote(options: &ClaudeCodeCliOptions, config: &super::ssh::SshCo
         "nativeTools":NATIVE_BUILTIN_TOOLS,
     }), Some((send,bridge.controls.clone(),bridge.options.clone()))).await
         .map_err(|error| {
-            let diagnostic = startup_diagnostics::message("", error.as_bytes());
-            if super::turn_retry::is_disconnected(&error) && !super::turn_retry::is_disconnected(&diagnostic) {
-                super::turn_retry::disconnected(diagnostic)
-            } else { diagnostic }
+            // Bound terminal details without truncating the stage or retry tag.
+            let (summary, detail) = error.split_once('\n').unwrap_or((&error, ""));
+            startup_diagnostics::message(summary, detail.as_bytes())
         })?;
     let diagnostic = remote.diagnostic.clone();
     Ok(Arc::new(Session {
@@ -621,11 +625,11 @@ mod connection_lifecycle_tests {
 
 fn startup_error(session: &Session, summary: &str) -> String {
     let error = startup_diagnostics::message(summary, &session.diagnostic.lock().unwrap_or_else(|e| e.into_inner()));
-    if !super::turn_retry::startup_rejected(&error) && session.remote.as_ref().is_some_and(|remote|
+    let error = if !super::turn_retry::startup_rejected(&error) && session.remote.as_ref().is_some_and(|remote|
         !remote.alive() && super::turn_retry::is_disconnected(&remote.failure())) {
-        return super::turn_retry::disconnected(error);
-    }
-    super::turn_retry::ssh_startup_error(error)
+        super::turn_retry::disconnected(error)
+    } else { super::turn_retry::ssh_startup_error(error) };
+    super::turn_retry::with_context("TUI initialization", error)
 }
 
 fn disconnected_error(session: &Session, summary: &str) -> String {
@@ -984,13 +988,17 @@ async fn watch_bridge_health(session: &Session) -> String {
             let options = session.options.read().unwrap_or_else(|e| e.into_inner());
             (options["active"] == true).then(|| options["inputId"].as_str().map(str::to_owned)).flatten()
         };
-        if let Some(error) = id.as_deref().and_then(|id| session.controls.health_error(id)) {
+        let Some(id) = id else { continue; };
+        let transport_failure = session.remote.as_ref().and_then(|remote| remote.health_failure());
+        if let Some(error) = session.controls.health_error_with_transport(&id, transport_failure.as_deref()) {
             session.recovery_required.store(true, Ordering::SeqCst);
-            // TurnLease retires the process; the next submission reconciles the
-            // native archive. Do not classify this as an automatic tool retry.
+            // TurnLease retires this process. Proven transport loss uses the
+            // bounded retry loop, which reconciles native history and persisted
+            // tool outcomes before any input; isolated hook faults still stop.
             let transport = match session.remote.as_ref() {
                 Some(remote) => match remote.latency_ms() {
                     Some(ms) => format!("SSH transport heartbeat is responsive (last RTT {ms:.0} ms)."),
+                    None if transport_failure.is_some() => "SSH transport failure was detected.".into(),
                     None => "No recent SSH transport heartbeat is available; hook failure and transport loss cannot be distinguished.".into(),
                 },
                 None => "Local Claude bridge.".into(),

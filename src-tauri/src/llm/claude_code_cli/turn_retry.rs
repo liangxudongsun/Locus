@@ -18,6 +18,21 @@ pub(crate) fn is_disconnected(error: &str) -> bool {
     error.starts_with(DISCONNECTED)
 }
 
+/// Adding a stage must not hide the transport tag from the bounded retry loop.
+pub(super) fn with_context(context: &str, error: String) -> String {
+    match error.strip_prefix(DISCONNECTED) {
+        Some(reason) => disconnected(format!("{context}: {reason}")),
+        None => format!("{context}: {error}"),
+    }
+}
+
+fn with_first_disconnect(error: String, first: Option<&str>) -> String {
+    match first.filter(|first| !error.contains(*first)) {
+        Some(first) => format!("{error}\nFirst disconnect: {first}"),
+        None => error,
+    }
+}
+
 // OpenSSH has no structured startup verdict. Classify its bounded diagnostic
 // only at the SSH startup boundary, never arbitrary model/tool error text.
 pub(super) fn startup_rejected(error: &str) -> bool {
@@ -82,6 +97,7 @@ where
     R: FnMut(u32, String) -> RF,
     RF: Future<Output = Result<(), String>>,
 {
+    let mut first_disconnect = None;
     for index in 0..=delays.len() {
         if *cancel.borrow() {
             return Ok(None);
@@ -94,15 +110,20 @@ where
         let error = match result {
             Ok(value) => return Ok(Some(value)),
             Err(error) if is_disconnected(&error) => error,
-            Err(error) => return Err(error),
+            Err(error) => return Err(with_first_disconnect(error, first_disconnect.as_deref())),
         };
+        first_disconnect.get_or_insert_with(|| error.clone());
         let Some(delay) = delays.get(index) else {
-            return Err(format!("Claude connection recovery failed after {} retries. Resume the conversation when the connection is available. Last error: {error}", delays.len()));
+            return Err(with_first_disconnect(
+                format!("Claude connection recovery failed after {} retries. Resume the conversation when the connection is available. Last error: {error}", delays.len()),
+                first_disconnect.as_deref(),
+            ));
         };
         tokio::select! {
             biased;
             _ = cancel.changed() => return Ok(None),
-            result = before_retry(index as u32 + 1, error) => result?,
+            result = before_retry(index as u32 + 1, error) => result
+                .map_err(|error| with_first_disconnect(error, first_disconnect.as_deref()))?,
         }
         tokio::select! {
             biased;
@@ -202,6 +223,60 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error, "Unverified native history");
+    }
+
+    #[test]
+    fn stage_context_preserves_only_explicit_transport_classification() {
+        let error = with_context("History synchronization", disconnected("SSH output closed"));
+        assert!(is_disconnected(&error));
+        assert!(error.contains("History synchronization: SSH output closed"));
+        assert!(!is_disconnected(&with_context("History synchronization", "Invalid native history".into())));
+        // Merely containing 'timeout' must never turn a tool/provider failure into recovery.
+        assert!(!is_disconnected(&ssh_startup_error("SSH environment check timed out".into())));
+        assert!(!is_disconnected(&ssh_startup_error("tool execution timed out".into())));
+    }
+
+    #[tokio::test]
+    async fn recovery_retains_first_disconnect_on_exhaustion_and_fatal_history_error() {
+        for fatal in [false, true] {
+            let (_send, receive) = tokio::sync::watch::channel(false);
+            let count = AtomicU32::new(0);
+            let error = run::<(), _, _, _, _>(
+                |attempt| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        Err(if attempt == 1 {
+                            disconnected("initial SSH loss: server not responding")
+                        } else if fatal {
+                            with_context("History synchronization", "Invalid remote history".into())
+                        } else {
+                            disconnected("History synchronization: handshake timed out")
+                        })
+                    }
+                },
+                |_, _| async { Ok(()) },
+                receive,
+                &[Duration::ZERO; 3],
+            ).await.unwrap_err();
+            assert!(error.contains("First disconnect: Claude transport disconnected: initial SSH loss: server not responding"), "{error}");
+            assert!(error.contains("History synchronization"));
+            assert_eq!(count.load(Ordering::SeqCst), if fatal { 2 } else { 4 });
+            if fatal { assert!(error.contains("Invalid remote history")); }
+            else { assert!(error.contains("after 3 retries")); }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_precondition_failure_retains_first_disconnect() {
+        let (_send, receive) = tokio::sync::watch::channel(false);
+        let error = run::<(), _, _, _, _>(
+            |_| async { Err(disconnected("original SSH loss")) },
+            |_, _| async { Err("Native history cannot be verified; no input was replayed".into()) },
+            receive,
+            &[Duration::ZERO; 3],
+        ).await.unwrap_err();
+        assert!(error.contains("no input was replayed"));
+        assert!(error.contains("First disconnect: Claude transport disconnected: original SSH loss"));
     }
 
     #[tokio::test]

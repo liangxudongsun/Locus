@@ -7,6 +7,7 @@ import { useClaudePrewarm } from "../../composables/useClaudePrewarm";
 import { claudePrewarmSettings, connectClaudeSession } from "../../services/claudeConnection";
 import { useModelStore } from "../../stores/model";
 import { formatClaudeSshAddress } from "../../utils/claudeSshAddress";
+import { claudeDiagnosticRows } from "../../utils/claudeConnectionDiagnostics";
 import { t } from "../../i18n";
 import { listWorkspaceAgentInjectedItems } from "../../services/agent";
 import {
@@ -344,6 +345,21 @@ function unityHangPrimaryRows(diagnosis: UnityHangDiagnosis): StatusDetailRow[] 
       tier: "primary",
     });
   }
+  const stall = diagnosis.stall;
+  if (stall) {
+    rows.push({
+      label: t("chat.status.unity.hang.stall"),
+      value: translatedOr(
+        `chat.status.unity.hang.stallKind.${stall.kind}`,
+        t("chat.status.unity.hang.stallKind.unknown"),
+        Math.round(stall.forMs / 1000),
+      ),
+      tier: "primary",
+    });
+    if (stall.frame) {
+      rows.push({ label: t("chat.status.unity.hang.stallFrame"), value: stall.frame, mono: true, tier: "primary" });
+    }
+  }
   return rows;
 }
 
@@ -366,6 +382,16 @@ function unityHangDiagnosticRows(diagnosis: UnityHangDiagnosis): StatusDetailRow
         : t("chat.status.unity.hang.samples", diagnosis.sampleCount));
     }
     rows.push({ label: t("chat.status.unity.hang.source"), value: parts.join(" · ") });
+  }
+  if (diagnosis.stall && diagnosis.stall.samples > 0) {
+    rows.push({
+      label: t("chat.status.unity.hang.stallSampling"),
+      value: t(
+        "chat.status.unity.hang.stallSamples",
+        diagnosis.stall.samples,
+        diagnosis.stall.maxSuspendUs ?? 0,
+      ),
+    });
   }
   if (diagnosis.error) {
     rows.push({ label: t("chat.status.unity.hang.error"), value: diagnosis.error, mono: true });
@@ -1899,6 +1925,8 @@ const claudeRows = computed<StatusDetailRow[]>(() => {
     if (pool.starting) rows.push({ label: t("chat.status.claude.pool.warming"), value: String(pool.starting), mono: true });
     rows.push({ label: t("chat.status.claude.sessions"), value: t("chat.status.claude.sessionCounts", pool.active, pool.retained) });
   }
+  // Verbose diagnostic formatting is only needed while this panel is open.
+  if (activePopover.value === "claude") rows.push(...claudeDiagnosticRows(status.diagnostics));
   return rows;
 });
 

@@ -41,9 +41,17 @@ ARCHIVE_LIMIT = 256 * 1024 * 1024
 ARCHIVE_CHUNK = 192 * 1024
 
 
-def frame(value):
+def frame(value, announce_history_size=False):
+    encoded = None
+    if announce_history_size:
+        encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n"
+        # ASCII JSON: len is the exact byte count, including its terminating LF.
+        # Serialize the large hello only once; never add progress to normal PTY
+        # traffic or send history contents as diagnostic metadata.
+        frame({"type": "progress", "protocol": PROTOCOL,
+               "stage": "history_transfer", "bytes": len(encoded)})
     with output_lock:
-        sys.stdout.write(json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n")
+        sys.stdout.write(encoded if encoded is not None else json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n")
         sys.stdout.flush()
 
 
@@ -1385,6 +1393,8 @@ def run(config):
     mode = config.get("mode", "session")
     if mode not in ("inspect", "prepare", "session", "fork", "rewind", "history", "archive"):
         raise ValueError("Invalid SSH operation")
+    frame({"type": "progress", "protocol": PROTOCOL, "source": "helper",
+           "stage": "history" if mode in ("history", "archive") else "environment"})
     if mode == "archive":
         return archive_listener(config)
     if mode == "history":
@@ -1393,13 +1403,17 @@ def run(config):
         if config.get("requireIdle"):
             key = str(uuid.UUID(config["sessionKey"]))
             root = Path.home() / ".local/share/locus/claude-ssh/v1/sessions" / key
+            frame({"type": "progress", "protocol": PROTOCOL, "stage": "history_lock"})
             with acquire_session_lease(root):
+                frame({"type": "progress", "protocol": PROTOCOL, "stage": "history_read"})
                 history = read_native_history(config)
         else:
+            frame({"type": "progress", "protocol": PROTOCOL, "stage": "history_read"})
             history = read_native_history(config)
+        frame({"type": "progress", "protocol": PROTOCOL, "stage": "history_serialize"})
         info = {"pythonInstalled": True, "cliSupported": False, "authenticated": False,
                 "platform": sys.platform, "home": str(Path.home()), "history": history}
-        frame({"type": "hello", "protocol": PROTOCOL, "info": info})
+        frame({"type": "hello", "protocol": PROTOCOL, "info": info}, announce_history_size=True)
         return
     unlock_for_connection(config)
     cli, source, env, info = prepare(config, mode)
@@ -1416,6 +1430,7 @@ def run(config):
         raise RuntimeError("Remote Claude is not logged in. Configure Claude authentication on that server first.")
     key = str(uuid.UUID(config["sessionKey"]))
     root = Path.home() / ".local/share/locus/claude-ssh/v1/sessions" / key
+    frame({"type": "progress", "protocol": PROTOCOL, "stage": "tui"})
     with acquire_session_lease(root):
         return run_session(config, cli, source, env, info, root)
 

@@ -60,7 +60,11 @@ impl BridgeHealth {
             turn.fault.get_or_insert_with(|| format!("Claude bridge failed: {}. {RECOVERY}", error.chars().take(2048).collect::<String>()));
         }
     }
+    #[cfg(test)]
     pub fn error(&self, id: &str, now: Instant) -> Option<String> {
+        self.error_with_transport(id, now, None)
+    }
+    pub fn error_with_transport(&self, id: &str, now: Instant, transport_failure: Option<&str>) -> Option<String> {
         let turn = self.turn.as_ref().filter(|turn| turn.id == id)?;
         if let Some(error) = &turn.fault { return Some(error.clone()); }
         let reason = if now.saturating_duration_since(turn.last_seen) >= HEARTBEAT_LEASE {
@@ -68,13 +72,62 @@ impl BridgeHealth {
         } else if turn.terminal_since.is_some_and(|at| now.saturating_duration_since(at) >= TERMINAL_GRACE) {
             "Claude finished its turn but Locus did not receive its completion"
         } else { return None; };
-        Some(format!("{reason} (last activity {}s ago). {RECOVERY}", now.saturating_duration_since(turn.last_seen).as_secs()))
+        let error = format!("{reason} (last activity {}s ago). {RECOVERY}", now.saturating_duration_since(turn.last_seen).as_secs());
+        // Only a silent worker together with transport-level evidence enters
+        // native-history recovery. Explicit hook faults, worker replacement and
+        // missing terminal receipts remain fatal; never retry their text by keyword.
+        Some(match transport_failure.filter(|_| turn.terminal_since.is_none()) {
+            Some(failure) => format!("{failure}\n{error}"),
+            None => error,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hook_silence_recovers_only_with_transport_evidence() {
+        use super::super::turn_retry;
+        let now = Instant::now();
+        let mut health = BridgeHealth::default();
+        health.begin_turn("run", now);
+        let disconnected = turn_retry::disconnected("SSH transport heartbeat received no response for 30s");
+        assert!(health.error_with_transport("run", now, Some(&disconnected)).is_none());
+        let silent = now + HEARTBEAT_LEASE;
+        // Both a responsive transport and a missing/unproven RTT pass no failure.
+        assert!(!turn_retry::is_disconnected(&health.error_with_transport("run", silent, None).unwrap()));
+        let error = health.error_with_transport("run", silent, Some(&disconnected)).unwrap();
+        assert!(turn_retry::is_disconnected(&error));
+        assert!(error.contains("hooks stopped reporting") && error.contains("heartbeat"));
+        assert!(health.error_with_transport("old-run", silent, Some(&disconnected)).is_none());
+        for failure in ["Invalid SSH protocol frame", "Permission denied", "Claude plugin validation failed"] {
+            assert!(!turn_retry::is_disconnected(&health.error_with_transport("run", silent, Some(failure)).unwrap()));
+        }
+    }
+
+    #[test]
+    fn transport_loss_does_not_override_explicit_hook_faults_or_terminal_receipts() {
+        use super::super::turn_retry;
+        let now = Instant::now();
+        let disconnected = turn_retry::disconnected("SSH output closed");
+        for fault in ["tool connection timed out", "unknown tool outcome", "plugin validation failed"] {
+            let mut health = BridgeHealth::default();
+            health.begin_turn("run", now);
+            health.fault("run", fault);
+            let error = health.error_with_transport("run", now + HEARTBEAT_LEASE, Some(&disconnected)).unwrap();
+            assert!(!turn_retry::is_disconnected(&error) && error.contains(fault));
+        }
+        let mut health = BridgeHealth::default();
+        health.worker_ready("native", false).unwrap();
+        health.begin_turn("run", now);
+        health.worker_ready("native", true).unwrap_err();
+        assert!(!turn_retry::is_disconnected(&health.error_with_transport("run", now + HEARTBEAT_LEASE, Some(&disconnected)).unwrap()));
+        health.begin_turn("next", now);
+        health.observe("next", "complete", now);
+        assert!(!turn_retry::is_disconnected(&health.error_with_transport("next", now + HEARTBEAT_LEASE, Some(&disconnected)).unwrap()));
+    }
+
     #[test]
     fn long_tools_keep_the_lease_alive_but_a_live_process_without_mod_does_not() {
         let mut health = BridgeHealth::default();

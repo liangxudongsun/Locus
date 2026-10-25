@@ -56,7 +56,43 @@ export interface ClaudeConnection {
 }
 export const getClaudeConnection = () => ipcInvoke<ClaudeConnection>('get_claude_connection').then(rememberConnection);
 export type ClaudeConnectionPhase = 'disconnected' | 'connecting' | 'starting' | 'ready';
+export interface ClaudeTransportSnapshot {
+  id: number;
+  pid: number | null;
+  operation: string;
+  stage: string;
+  elapsedMs: number;
+  stageElapsedMs: number;
+  receivedBytes: number;
+  sentBytes: number;
+  lastReceiveAgeMs: number | null;
+  partialFrameBytes: number;
+  expectedFrameBytes: number | null;
+  stageReceivedBytes: number;
+  stageBytesPerSecond: number | null;
+  heartbeatAgeMs: number | null;
+  pendingHeartbeats: number;
+  timeline: readonly { stage: string; elapsedMs: number }[];
+}
+export interface ClaudeConnectionDiagnostics {
+  active: ClaudeTransportSnapshot | null;
+  lastFailure: {
+    at: number;
+    kind: string;
+    message: string;
+    stderr: string;
+    exitCode: number | null;
+    transport: ClaudeTransportSnapshot;
+  } | null;
+  probe: {
+    failureId: number;
+    at: number;
+    state: string;
+    checks: readonly { name: string; outcome: string; elapsedMs: number; detail: string }[];
+  } | null;
+}
 export interface ClaudeSessionConnection {
+  diagnostics?: ClaudeConnectionDiagnostics;
   phase: ClaudeConnectionPhase;
   target: string;
   port: number | null;

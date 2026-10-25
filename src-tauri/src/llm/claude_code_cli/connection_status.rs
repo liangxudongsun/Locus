@@ -21,6 +21,7 @@ pub(crate) struct ConnectionStatus {
     pub latency_ms: Option<f64>,
     pub last_error: Option<String>,
     pub pool: PoolStatus,
+    pub diagnostics: super::super::ssh::diagnostics::Overview,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -55,7 +56,7 @@ impl Drop for StartupStatus {
 
 fn snapshot(config: &SshConfig, phase: ConnectionPhase) -> ConnectionStatus {
     ConnectionStatus { phase, target: config.target.clone(), port: config.port, latency_ms: None, last_error: None,
-        pool: PoolStatus { state: "disabled", ..Default::default() } }
+        pool: PoolStatus { state: "disabled", ..Default::default() }, diagnostics: Default::default() }
 }
 
 #[cfg(test)]
@@ -131,6 +132,7 @@ pub(crate) fn connection_overview(id: Option<&str>, cwd: Option<&str>, model: Op
     result.latency_ms = selected.and_then(|p| p.latency_ms);
     result.pool = pool_status(&processes, &pool, settings.prewarm && settings.remote.as_ref() == Some(config), settings.pool_capacity.clamp(1, 4));
     result.last_error = pool.last_error;
+    result.diagnostics = super::super::ssh::diagnostics::overview(config);
     Some(result)
 }
 
