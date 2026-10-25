@@ -85,6 +85,11 @@ pub struct SessionDetail {
 pub struct SessionViewSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_sync_warning: Option<String>,
+    /// Workspace event stream revision at which the live runtime state was
+    /// cut. Stream events at or below it are already reflected in this view;
+    /// clients replay the events above it that arrived while loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_revision: Option<u64>,
     pub session: SessionDetail,
     #[serde(default)]
     pub user_message_ids: Vec<String>,

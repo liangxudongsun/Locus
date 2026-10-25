@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import { flushWindowEventInterests, retainWindowEventInterest } from "./windowEventInterests";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
   FileDiffRequest,
@@ -9,7 +10,7 @@ import type {
   SemanticTargetRequest,
 } from "../types";
 import type { WorkspaceRef } from "./project";
-import { subscribeWorkspaceFileChanges } from "./workspaceExplorer";
+import { subscribeWorkspaceFileChanges, workspaceChangeAffectsPath } from "./workspaceExplorer";
 import type { RoutedWorkspaceEvent } from "./project";
 import { listenWorkspaceEvent } from "./workspaceEventHub";
 
@@ -116,13 +117,16 @@ export function parseDiffWorkspaceRefFromKey(key: string): WorkspaceRef | undefi
 
 const LRU_CAPACITY = 50;
 const cache = new Map<string, FileDiffPayload>();
+// Cached previews still need invalidations while their tab is closed. These
+// interests share the LRU's bounded lifetime, rather than subscribing globally.
+const cacheInterests = new Map<string, () => void>();
 
 function lruSet(key: string, value: FileDiffPayload) {
   if (cache.has(key)) cache.delete(key);
   cache.set(key, value);
   if (cache.size > LRU_CAPACITY) {
     const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
+    if (oldest !== undefined) invalidateDiffCache(oldest);
   }
 }
 
@@ -171,17 +175,20 @@ export async function diffSingleFile(
   if (existing) return existing;
 
   console.log("[diff] IPC call start, key=", key);
-  const promise = ipcInvoke<FileDiffPayload>("diff_single_file", {
+  if (workspaceRef) cacheInterests.set(key, retainWindowEventInterest({ workspaceRef }));
+  const promise = flushWindowEventInterests().then(() => ipcInvoke<FileDiffPayload>("diff_single_file", {
     request,
     workspaceRef: workspaceRef ?? null,
-  }).then((payload) => {
+  })).then((payload) => {
     console.log("[diff] IPC resolved, payload=", !!payload);
-    lruSet(key, payload);
-    inflight.delete(key);
+    if (inflight.get(key) === promise) {
+      lruSet(key, payload);
+      inflight.delete(key);
+    }
     return payload;
   }).catch((err) => {
     console.error("[diff] IPC error:", err);
-    inflight.delete(key);
+    if (inflight.get(key) === promise) invalidateDiffCache(key);
     throw err;
   });
 
@@ -232,21 +239,24 @@ export function isTokenStale(token: number): boolean {
 }
 
 export function invalidateDiffCache(key: string) {
+  cacheInterests.get(key)?.();
+  cacheInterests.delete(key);
   cache.delete(key);
   inflight.delete(key);
 }
 
 /**
- * Drop every cached/in-flight diff whose filePath or oldPath matches one of
- * the given workspace-relative paths (e.g. after a per-file revert changed
- * the worktree side of the diff).
+ * Drop every cached/in-flight diff whose filePath or oldPath is one of the
+ * given workspace-relative paths or lies below one of them (e.g. after a
+ * per-file revert, a directory delete or rename, or a watcher rescan of a
+ * subtree; "." covers the whole checkout).
  */
 export function invalidateDiffCacheForFiles(
   paths: readonly string[],
   workspaceRef?: WorkspaceRef | null,
 ) {
   if (paths.length === 0) return;
-  const targets = new Set(paths);
+  const affects = (target: string) => paths.some((path) => workspaceChangeAffectsPath(path, target));
   const matches = (key: string) => {
     const request = parseDiffRequestKey(key);
     if (!request) return false;
@@ -260,13 +270,10 @@ export function invalidateDiffCacheForFiles(
       if (workspaceRef.expectedMaterializationEpoch != null
         && keyWorkspaceRef.expectedMaterializationEpoch !== workspaceRef.expectedMaterializationEpoch) return false;
     }
-    return targets.has(request.filePath) || (!!request.oldPath && targets.has(request.oldPath));
+    return affects(request.filePath) || (!!request.oldPath && affects(request.oldPath));
   };
-  for (const key of [...cache.keys()]) {
-    if (matches(key)) cache.delete(key);
-  }
-  for (const key of [...inflight.keys()]) {
-    if (matches(key)) inflight.delete(key);
+  for (const key of new Set([...cache.keys(), ...inflight.keys()])) {
+    if (matches(key)) invalidateDiffCache(key);
   }
 }
 

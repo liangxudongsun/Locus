@@ -630,8 +630,8 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   });
 
   // -- Event listener registration --
-  function handleStreamEvent(payload: StreamEvent) {
-    const handled = chatStore.handleStreamEvent(payload);
+  function handleStreamEvent(payload: StreamEvent, streamRevision?: number) {
+    const handled = chatStore.handleStreamEvent(payload, streamRevision);
     if (!handled) return;
 
     if (
@@ -792,7 +792,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         } else if (event.eventName === "knowledge-changed") {
           handleKnowledgeChanged(event.payload as KnowledgeChangedEvent);
         } else if (event.eventName === "stream-event") {
-          handleStreamEvent(event.payload as StreamEvent);
+          handleStreamEvent(event.payload as StreamEvent, event.streamRevision);
         } else if (event.eventName === "session-content-changed") {
           handleSessionContentChanged(event.payload as SessionContentChangedEvent);
         } else if (event.eventName === "session-title-updated") {

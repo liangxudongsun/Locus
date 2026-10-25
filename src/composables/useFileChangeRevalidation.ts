@@ -1,7 +1,8 @@
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { WorkspaceRef } from "../services/project";
+import { workspaceMaterializationMatches, type WorkspaceRef } from "../services/project";
 import {
   subscribeWorkspaceFileChanges,
+  workspaceChangeAffectsPath,
   type WorkspaceFileChangedPayload,
 } from "../services/workspaceExplorer";
 import type { ProjectExplorerFileRevision } from "../types/workbench";
@@ -55,22 +56,30 @@ export function fileRevisionsEqual(
   return !!left && !!right && left.key === right.key;
 }
 
+type FileChangeEvent = {
+  checkoutId: string;
+  workspaceGeneration: number;
+  materializationEpoch?: number | null;
+  payload: WorkspaceFileChangedPayload;
+};
+
+export function workspaceFileChangeInScope(
+  event: FileChangeEvent,
+  workspaceRef: WorkspaceRef | null | undefined,
+): boolean {
+  return !!workspaceRef && event.checkoutId === workspaceRef.checkoutId
+    && (workspaceRef.expectedGeneration == null || event.workspaceGeneration === workspaceRef.expectedGeneration)
+    && workspaceMaterializationMatches(workspaceRef.expectedMaterializationEpoch, event.materializationEpoch);
+}
+
 export function workspaceFileChangeMatches(
-  event: {
-    checkoutId: string;
-    workspaceGeneration: number;
-    payload: WorkspaceFileChangedPayload;
-  },
+  event: FileChangeEvent,
   workspaceRef: WorkspaceRef | null | undefined,
   workspacePath: string | null | undefined,
 ): boolean {
-  if (!workspaceRef || event.checkoutId !== workspaceRef.checkoutId) return false;
-  if (
-    workspaceRef.expectedGeneration != null
-    && event.workspaceGeneration !== workspaceRef.expectedGeneration
-  ) return false;
+  if (!workspaceFileChangeInScope(event, workspaceRef)) return false;
   const expectedPath = normalizedPath(workspacePath);
-  return !!expectedPath && normalizedPath(event.payload.path) === expectedPath;
+  return !!expectedPath && workspaceChangeAffectsPath(event.payload.path, expectedPath);
 }
 
 export function useFileChangeRevalidation(options: FileChangeRevalidationOptions) {
@@ -169,7 +178,7 @@ export function useFileChangeRevalidation(options: FileChangeRevalidationOptions
         path,
       ))) return;
       scheduleProbe("event");
-    }).then((release) => {
+    }, options.workspaceRef).then((release) => {
       if (destroyed) release();
       else releaseWorkspaceEvents = release;
     }).catch((error) => options.onError?.(error));

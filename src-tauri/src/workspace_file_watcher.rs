@@ -10,6 +10,15 @@ use crate::workspace_changes::{WorkspaceChangeEvent, WorkspaceChangeKind, Worksp
 use crate::workspace_service::event::{emit_for_workspace_scope, WorkspaceEventScope};
 use crate::workspace_service::runtime::{WorkspaceLease, WorkspaceLeaseKind, WorkspaceRuntime};
 
+mod coalescer;
+
+struct FileWatcher {
+    // Stop the publisher before dropping the native watcher; callbacks after
+    // shutdown see a stopped queue and cannot publish into a retired scope.
+    _worker: coalescer::ChangeWorker,
+    _watcher: RecommendedWatcher,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FileTreeChange {
@@ -19,7 +28,7 @@ struct FileTreeChange {
 }
 
 struct Registration {
-    _watcher: RecommendedWatcher,
+    _watcher: FileWatcher,
     _lease: WorkspaceLease,
     owners: HashMap<String, String>, // subscription token -> native window label
     materialization_epoch: u64,
@@ -60,7 +69,7 @@ impl WorkspaceFileWatchState {
         &self,
         runtime: &Arc<WorkspaceRuntime>,
         window: &str,
-        create: impl FnOnce() -> Result<RecommendedWatcher, String>,
+        create: impl FnOnce() -> Result<FileWatcher, String>,
     ) -> Result<Option<String>, String> {
         let root = runtime.root();
         // Match the explorer's Unity detection, including non-Unity projects
@@ -157,18 +166,20 @@ fn event_changes(root: &Path, event: &Event) -> Vec<(String, WorkspaceChangeKind
 
 fn watch(
     root: &Path,
-    mut publish: impl FnMut(Vec<(String, WorkspaceChangeKind)>, bool) + Send + 'static,
-) -> Result<RecommendedWatcher, String> {
+    publish: impl FnMut(Vec<(String, WorkspaceChangeKind)>, bool) + Send + 'static,
+) -> Result<FileWatcher, String> {
     let callback_root = PathBuf::from(root);
+    let queue = coalescer::ChangeQueue::default();
+    let callback_queue = queue.clone();
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<Event>| {
             match event {
                 Ok(event) if !event.need_rescan() && !event.paths.is_empty() => {
-                    publish(event_changes(&callback_root, &event), false)
+                    callback_queue.push(event_changes(&callback_root, &event), false)
                 }
                 // Lost or ambiguous events invalidate every loaded directory. The
                 // frontend coalesces these with ordinary changes before reading disk.
-                _ => publish(vec![(".".into(), WorkspaceChangeKind::Upsert)], true),
+                _ => callback_queue.push(Vec::new(), true),
             }
         },
         Config::default(),
@@ -177,7 +188,11 @@ fn watch(
     watcher
         .watch(root, RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
-    Ok(watcher)
+    let worker = queue.start(publish)?;
+    Ok(FileWatcher {
+        _worker: worker,
+        _watcher: watcher,
+    })
 }
 
 #[cfg(test)]

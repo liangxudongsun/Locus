@@ -2,6 +2,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import { listenWindowEvent } from "./windowEventTransport";
 import {
   listenWorkspaceEvent,
   WORKSPACE_EVENT_NAME,
@@ -168,6 +169,9 @@ export function getLocusRuntime(): LocusRuntime {
             (event) => handler(event.payload as T),
             options,
           );
+        }
+        if (eventName === "stream-event") {
+          return listenWindowEvent<T>(eventName, event => handler(event.payload));
         }
         return tauriListen<T>(eventName, (event) => handler(event.payload))
           .then((release: UnlistenFn) => release);

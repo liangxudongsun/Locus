@@ -90,6 +90,7 @@ vi.mock("../services/systemNotifications", () => ({
 
 vi.mock("../services/tauriRuntime", () => ({
   hasTauriWindowRuntime: () => true,
+  getCurrentTauriWindowLabel: () => "main",
   showCurrentTauriWindow: vi.fn().mockResolvedValue(undefined),
 }));
 

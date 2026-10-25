@@ -2,6 +2,7 @@
 import { createApp, defineComponent, h, nextTick, reactive, type App } from "vue";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAssetState } from "../composables/useAssetState";
+import { listDirEntriesPage } from "../services/project";
 
 const mocks = vi.hoisted(() => ({
   disk: new Map<string, string>(),
@@ -12,7 +13,8 @@ const mocks = vi.hoisted(() => ({
   finishListing: null as null | (() => void),
 }));
 vi.mock("../services/workspaceFileWatch", () => ({ startWorkspaceFileWatch: mocks.start }));
-vi.mock("../services/project", () => ({
+vi.mock("../services/project", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/project")>()),
   listDirEntriesPage: vi.fn(async (path: string, _scope: unknown, offset: number, limit: number, _meta: boolean, hidden: string[]) => {
     // The actual command refreshes at offset 0 and caches the remaining pages.
     if (offset === 0 || !mocks.cache.has(path)) {
@@ -142,6 +144,32 @@ it("rescans loaded directories on an overflow and preserves configured hidden di
   mocks.disk.set("Docs/new.md", "file"); mocks.disk.set("node_modules", "folder");
   emit(".", reference, true); await vi.advanceTimersByTimeAsync(120);
   expect(paths(state)).toContain("Docs/new.md"); expect(paths(state)).not.toContain("node_modules");
+});
+
+it("ignores hidden subtree overflow but refreshes visible subtree contents", async () => {
+  mocks.disk.set("Docs", "folder");
+  const { state } = mount(); await flush(); await state.togglePath("Docs");
+  vi.mocked(listDirEntriesPage).mockClear();
+  emit("node_modules/packages", reference, true);
+  await vi.advanceTimersByTimeAsync(150);
+  expect(listDirEntriesPage).not.toHaveBeenCalled();
+  mocks.disk.set("Docs/new.md", "file");
+  emit("Docs", reference, true);
+  await vi.advanceTimersByTimeAsync(120);
+  expect(paths(state)).toContain("Docs/new.md");
+});
+
+it("reconciles only a rescanned subtree, including its loaded descendants", async () => {
+  // The watcher collapses an overflow into the narrowest covering directory.
+  mocks.disk.set("Docs", "folder"); mocks.disk.set("Docs/Inner", "folder"); mocks.disk.set("Other", "folder");
+  const { state } = mount(); await flush();
+  await state.togglePath("Docs"); await state.togglePath("Docs/Inner"); await state.togglePath("Other");
+  vi.mocked(listDirEntriesPage).mockClear();
+  mocks.disk.set("Docs/Inner/new.md", "file"); mocks.disk.set("Other/unrelated.md", "file");
+  emit("Docs", reference, true); await vi.advanceTimersByTimeAsync(150);
+  expect(paths(state)).toContain("Docs/Inner/new.md");
+  expect(vi.mocked(listDirEntriesPage).mock.calls.map(([path]) => path)).not.toContain("Other");
+  expect(paths(state)).not.toContain("Other/unrelated.md");
 });
 
 it("releases a watcher that finishes starting after unmount", async () => {

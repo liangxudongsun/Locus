@@ -4,6 +4,8 @@ import {
   onUnmounted,
   reactive,
   shallowRef,
+  shallowReactive,
+  toRaw,
   toValue,
   watch,
   type MaybeRefOrGetter,
@@ -38,6 +40,7 @@ import {
 import { useModelStore } from "../stores/model";
 import { useNotificationStore } from "../stores/notification";
 import type { WorkspaceRef } from "../services/project";
+import { flushWindowEventInterests, retainWindowEventInterest, watchWindowEventInterests, type WindowEventInterest } from "../services/windowEventInterests";
 import {
   bindSessionAsyncTaskUpdateConsumer,
   bindSessionStreamEventConsumer,
@@ -48,6 +51,7 @@ import {
   subscribeSessionContentChangeConsumer,
   subscribeSessionStreamEventConsumer,
   subscribeSessionStreamEvents,
+  type SessionStreamEventDispatch,
 } from "../services/sessionStreamEventHub";
 import {
   buildInterruptedTrailingToolResultMessages,
@@ -287,6 +291,7 @@ interface SessionViewPreload {
   workspaceRef: WorkspaceRef | null;
   messageLimit: number;
   createdAt: number;
+  releaseInterest: () => void;
 }
 
 // Pointing at a session in the sidebar preloads its first page, inline path
@@ -299,18 +304,75 @@ const MAX_SESSION_VIEW_PRELOADS = 4;
 const sessionViewPreloads = new Map<string, SessionViewPreload>();
 let sessionViewPreloadInvalidation: (() => void) | null = null;
 
+// A loaded view replaces a session's stream state with a snapshot cut at a
+// stream revision: it reflects every event at or below it and none above it.
+// While a load for a (shared) state is in flight its stream events are held;
+// once the snapshot is applied only the held events above the cut are applied,
+// each exactly once. Applying them on arrival lost every event published
+// between the backend cut and the client applying the snapshot. Keyed by the
+// raw state so held deltas never trigger reactivity.
+interface HeldStreamEvent { event: StreamEvent; streamRevision: number | null }
+const streamLoadHandoffs = new WeakMap<object, { loads: Set<number>; events: HeldStreamEvent[] }>();
+let nextStreamLoadToken = 0;
+
+function beginStreamLoadHandoff(state: EmbeddedChatState): number {
+  const key = toRaw(state);
+  const handoff = streamLoadHandoffs.get(key) ?? { loads: new Set<number>(), events: [] };
+  const token = ++nextStreamLoadToken;
+  handoff.loads.add(token);
+  streamLoadHandoffs.set(key, handoff);
+  return token;
+}
+
+function holdStreamDispatch(state: EmbeddedChatState, dispatch: SessionStreamEventDispatch): boolean {
+  // Only routed events carry a revision that can be placed against a cut;
+  // legacy events keep applying on arrival.
+  if (dispatch.source.kind !== "workspace") return false;
+  const handoff = streamLoadHandoffs.get(toRaw(state));
+  if (!handoff) return false;
+  handoff.events.push({ event: dispatch.event, streamRevision: dispatch.source.streamRevision });
+  return true;
+}
+
+/** Returns the held events to apply now, in arrival order. `applied` is the cut
+ * of the snapshot this load applied, or null when it applied none. */
+function finishStreamLoadHandoff(
+  state: EmbeddedChatState,
+  token: number,
+  applied: { streamRevision: number | null } | null,
+): StreamEvent[] {
+  const key = toRaw(state);
+  const handoff = streamLoadHandoffs.get(key);
+  if (!handoff || !handoff.loads.delete(token)) return [];
+  const cut = applied?.streamRevision;
+  if (cut != null) {
+    handoff.events = handoff.events.filter((item) => item.streamRevision != null && item.streamRevision > cut);
+  }
+  // Without a cut the held events cannot be placed against the snapshot;
+  // applying them keeps their lifecycle effects (streamed text may repeat).
+  // A newer load of this state owns the held events; its cut is later.
+  if (handoff.loads.size > 0) return [];
+  streamLoadHandoffs.delete(key);
+  return handoff.events.map((item) => item.event);
+}
+
+function discardSessionViewPreload(sessionId: string): void {
+  sessionViewPreloads.get(sessionId)?.releaseInterest();
+  sessionViewPreloads.delete(sessionId);
+}
+
 function ensureSessionViewPreloadInvalidation(): void {
   if (sessionViewPreloadInvalidation) return;
   const owner = {};
   const stopStream = subscribeSessionStreamEvents(({ event }) => {
-    sessionViewPreloads.delete(event.sessionId.trim());
+    discardSessionViewPreload(event.sessionId.trim());
   });
   const stopTasks = subscribeSessionAsyncTaskUpdates((update) => {
-    sessionViewPreloads.delete(update.sessionId);
+    discardSessionViewPreload(update.sessionId);
   });
   const stopContent = subscribeSessionContentChangeConsumer(
     ({ sessionId }) => (sessionViewPreloads.has(sessionId) ? owner : null),
-    ({ sessionId }) => { sessionViewPreloads.delete(sessionId); },
+    ({ sessionId }) => { discardSessionViewPreload(sessionId); },
   );
   sessionViewPreloadInvalidation = () => { stopStream(); stopTasks(); stopContent(); };
 }
@@ -337,25 +399,29 @@ export function preloadEmbeddedChatSession(sessionId: string, workspaceRef: Work
     && Date.now() - existing.createdAt < SESSION_VIEW_PRELOAD_TTL_MS
   ) return;
   ensureSessionViewPreloadInvalidation();
-  const snapshot = sessionService.loadSessionView(normalizedSessionId, messageLimit, false)
+  const releaseInterest = retainWindowEventInterest({ sessionId: normalizedSessionId });
+  const expiry = setTimeout(() => discardSessionViewPreload(normalizedSessionId), SESSION_VIEW_PRELOAD_TTL_MS);
+  const snapshot = flushWindowEventInterests()
+    .then(() => sessionService.loadSessionView(normalizedSessionId, messageLimit, false))
     .then(async (view) => {
       const pathStatuses = prefetchMessagePathStatuses(view.session.messages);
       if (pathStatuses) await pathStatuses;
       return view;
     })
     .catch(() => null);
-  sessionViewPreloads.delete(normalizedSessionId);
+  discardSessionViewPreload(normalizedSessionId);
   sessionViewPreloads.set(normalizedSessionId, {
     snapshot,
     metadata: loadSessionMetadataBundle(normalizedSessionId, workspaceRef),
     workspaceRef,
     messageLimit,
     createdAt: Date.now(),
+    releaseInterest: () => { clearTimeout(expiry); releaseInterest(); },
   });
   while (sessionViewPreloads.size > MAX_SESSION_VIEW_PRELOADS) {
     const oldest = sessionViewPreloads.keys().next().value as string | undefined;
     if (!oldest) break;
-    sessionViewPreloads.delete(oldest);
+    discardSessionViewPreload(oldest);
   }
 }
 
@@ -364,7 +430,7 @@ function takeSessionViewPreload(
   messageLimit: number,
 ): SessionViewPreload | null {
   const preload = sessionViewPreloads.get(sessionId) ?? null;
-  sessionViewPreloads.delete(sessionId);
+  discardSessionViewPreload(sessionId);
   if (
     !preload
     || preload.messageLimit !== messageLimit
@@ -431,6 +497,11 @@ function releaseSharedEmbeddedChatState(state: EmbeddedChatState): void {
     return;
   }
   sharedEmbeddedChatRetainCounts.delete(state);
+  // Same-turn pane transfers keep their subscription. A genuinely closed
+  // session must hydrate again after its targeted stream has been released.
+  setTimeout(() => {
+    if (!(sharedEmbeddedChatRetainCounts.get(state) ?? 0)) state.hydrated = false;
+  }, 0);
   removeEvictedSharedState(state);
 }
 
@@ -603,8 +674,9 @@ function traceEmbeddedStreamMutation(mutation: StreamMutation) {
 function traceEmbeddedOrder(
   state: EmbeddedChatState,
   event: string,
-  detail: Record<string, unknown> = {},
+  detail: () => Record<string, unknown> = () => ({}),
 ) {
+  if (!isToolCollapseTraceEnabled(event)) return;
   logToolCollapseTrace("embedded-chat:order", event, {
     key: state.key,
     sessionId: state.sessionId,
@@ -618,7 +690,7 @@ function traceEmbeddedOrder(
       count: deferredMessages.length,
       messages: traceEmbeddedMessageOrder(deferredMessages),
     })),
-    ...detail,
+    ...detail(),
   });
 }
 
@@ -628,27 +700,28 @@ function deferUserMessage(
 ) {
   const messagesForRun = state.deferredUserMessagesByRun.get(event.runId) ?? [];
   state.deferredUserMessagesByRun.set(event.runId, mergeUserMessage(messagesForRun, event.message));
-  traceEmbeddedOrder(state, "embeddedDeferUserMessageDuringToolRound", {
+  traceEmbeddedOrder(state, "embeddedDeferUserMessageDuringToolRound", () => ({
     event: traceEmbeddedStreamEvent(event),
     deferredForRun: traceEmbeddedMessageOrder(state.deferredUserMessagesByRun.get(event.runId) ?? []),
-  });
+  }));
 }
 
 function flushDeferredUserMessages(state: EmbeddedChatState, runId: string) {
   const deferredMessages = state.deferredUserMessagesByRun.get(runId);
   if (!deferredMessages || deferredMessages.length === 0) return;
 
-  const messagesBeforeFlush = traceEmbeddedMessageOrder(state.messages);
+  const messagesBeforeFlush = isToolCollapseTraceEnabled("embeddedFlushDeferredUserMessages")
+    ? traceEmbeddedMessageOrder(state.messages) : null;
   for (const message of deferredMessages) {
     state.messages = mergeUserMessage(state.messages, message);
   }
   state.deferredUserMessagesByRun.delete(runId);
-  traceEmbeddedOrder(state, "embeddedFlushDeferredUserMessages", {
+  traceEmbeddedOrder(state, "embeddedFlushDeferredUserMessages", () => ({
     runId,
     flushedMessages: traceEmbeddedMessageOrder(deferredMessages),
     messagesBeforeFlush,
     messagesAfterFlush: traceEmbeddedMessageOrder(state.messages),
-  });
+  }));
 }
 
 function shouldDeferUserMessage(
@@ -1009,13 +1082,13 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
   }
   if (traceApplyMutation) {
-    traceEmbeddedOrder(state, "embeddedApplyStreamMutation", {
+    traceEmbeddedOrder(state, "embeddedApplyStreamMutation", () => ({
       mutation: traceEmbeddedStreamMutation(mutation),
       messagesBeforeMutation,
       messagesAfterMutation: traceEmbeddedMessageOrder(state.messages),
       activeToolCallsBeforeMutation,
       activeToolCallsAfterMutation: traceEmbeddedToolCallOrder(state.activeToolCalls),
-    });
+    }));
   }
 }
 
@@ -1036,7 +1109,7 @@ function applyAsyncTaskUpdateToState(
 export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const modelStore = useModelStore();
   const statesByKey = new Map<string, EmbeddedChatState>();
-  const sessionStates = new Map<string, EmbeddedChatState>();
+  const sessionStates = shallowReactive(new Map<string, EmbeddedChatState>());
   const activeState = shallowRef<EmbeddedChatState>(sharedEmbeddedChatState(
     toValue(options.sessionKey),
     toValue(options.initialSessionId) ?? null,
@@ -1157,9 +1230,12 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state = bindSharedEmbeddedChatSession(state, normalizedSessionId);
     state.loading = true;
     setEmbeddedError(state, null);
+    const streamLoad = beginStreamLoadHandoff(state);
+    let appliedCut: { streamRevision: number | null } | null = null;
     sessionStates.set(normalizedSessionId, state);
     let hydrated = false;
     try {
+      await flushWindowEventInterests();
       const workspaceRef = captureWorkspaceRef();
       const metadataVersion = ++state.metadataVersion;
       const baseline = {
@@ -1202,6 +1278,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         || state.sessionId !== normalizedSessionId
       ) return;
       applyLoadedSessionSnapshot(state, snapshot);
+      appliedCut = { streamRevision: snapshot.streamRevision ?? null };
       hydrated = true;
       void synchronizeRemoteHistoryInBackground(state, normalizedSessionId, epoch);
       const completedRun = state.latestCompletedRunId;
@@ -1242,12 +1319,26 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     } finally {
       if (sessionHydrationEpochs.get(state.key) === epoch) state.loading = false;
       if (hydrated) {
-        // The backend snapshot includes all events received before this load.
+        // Events buffered before any reducer existed precede this load's cut.
         bindSessionStreamEventConsumer(normalizedSessionId);
         bindSessionAsyncTaskUpdateConsumer(normalizedSessionId);
       } else {
         replayBufferedSessionEvents(normalizedSessionId);
         replayBufferedAsyncTaskUpdates(normalizedSessionId);
+      }
+      // Events that arrived during the load, above the snapshot's cut.
+      applyHeldStreamEvents(finishStreamLoadHandoff(state, streamLoad, appliedCut));
+    }
+  }
+
+  /** Isolates each held event, as live dispatch does: one failure must not
+   * drop the rest of the stream or fail the load that applied its snapshot. */
+  function applyHeldStreamEvents(events: StreamEvent[]): void {
+    for (const event of events) {
+      try {
+        handleStreamEvent(event);
+      } catch (error) {
+        console.error("[embedded-chat] failed to apply a stream event held during a session load", error);
       }
     }
   }
@@ -1276,6 +1367,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   async function reloadSessionState(state: EmbeddedChatState, sessionId: string, savedOnly = false): Promise<boolean> {
     const version = ++state.metadataVersion;
     const runId = state.currentRunId;
+    const streamLoad = beginStreamLoadHandoff(state);
+    let appliedCut: { streamRevision: number | null } | null = null;
     try {
       const workspaceRef = captureWorkspaceRef();
       const [snapshot, metadata] = await Promise.all([
@@ -1288,11 +1381,14 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       if (state.sessionId !== sessionId) return false;
       if (savedOnly && (version !== state.metadataVersion || runId !== state.currentRunId || state.isStreaming)) return false;
       applyLoadedSessionSnapshot(state, snapshot);
+      appliedCut = { streamRevision: snapshot.streamRevision ?? null };
       applyLoadedSessionMetadata(state, metadata);
       return true;
     } catch (error) {
       console.warn("[embedded-chat] failed to refresh session state:", error);
       return false;
+    } finally {
+      applyHeldStreamEvents(finishStreamLoadHandoff(state, streamLoad, appliedCut));
     }
   }
 
@@ -1300,7 +1396,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const state = resolveStateForEvent(event);
     if (!state) return;
 
-    traceEmbeddedOrder(state, "embeddedStreamEventReceived", {
+    traceEmbeddedOrder(state, "embeddedStreamEventReceived", () => ({
       event: traceEmbeddedStreamEvent(event),
       pendingInputs: visiblePendingInputs(state.pendingInputs).map((input, index) => ({
         index,
@@ -1312,7 +1408,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         displayTextLen: (input.displayText || input.text).length,
         displayTextPreview: previewTraceText(input.displayText || input.text, 48),
       })),
-    });
+    }));
 
     // Plan transitions may be emitted by a synthetic command run. They belong
     // to the durable session and must bypass active-run filtering.
@@ -1399,11 +1495,11 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       ? state.submittedUserMessagesByRun.get(event.runId) ?? null
       : null;
     const mutations = reduceStreamEvent(state, event);
-    traceEmbeddedOrder(state, "streamEventMutationBatch", {
+    traceEmbeddedOrder(state, "streamEventMutationBatch", () => ({
       event: traceEmbeddedStreamEvent(event),
       mutationCount: mutations.length,
       mutations: mutations.map(traceEmbeddedStreamMutation),
-    });
+    }));
     for (const mutation of mutations) {
       applyMutation(state, mutation);
     }
@@ -1693,6 +1789,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
     try {
       if (requestSessionId && options.beforeSessionLaunch) await options.beforeSessionLaunch(requestSessionId);
+      await flushWindowEventInterests();
       const launch = await sessionService.chat({
         workspaceRef,
         sessionId: requestSessionId,
@@ -1835,6 +1932,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
     try {
       if (options.beforeSessionLaunch) await options.beforeSessionLaunch(targetSessionId);
+      await flushWindowEventInterests();
       const launch = await sessionService.chat({
         workspaceRef,
         sessionId: targetSessionId,
@@ -2512,7 +2610,12 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       if (!sessionStreamSourceMatchesWorkspace(source, toValue(options.workspaceRef))) return null;
       return resolveStateForEvent(event);
     },
-    ({ event }) => handleStreamEvent(event),
+    (dispatch) => {
+      // A view load for this state is in flight: hold the event for the handoff.
+      const state = resolveStateForEvent(dispatch.event);
+      if (state && holdStreamDispatch(state, dispatch)) return;
+      handleStreamEvent(dispatch.event);
+    },
   );
   const unsubscribeAsyncTaskUpdates = subscribeSessionAsyncTaskUpdateConsumer(
     (update) => sessionStates.get(update.sessionId) ?? null,
@@ -2537,12 +2640,23 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     },
   );
 
+  const releaseEventInterests = watchWindowEventInterests(() => {
+    const interests: WindowEventInterest[] = [...sessionStates.keys()].map(sessionId => ({ sessionId }));
+    const state = activeState.value;
+    if (state.sessionId) interests.push({ sessionId: state.sessionId });
+    const workspaceRef = captureWorkspaceRef();
+    if (state.pendingRun && !state.sessionId && workspaceRef) interests.push({ streamWorkspaceRef: workspaceRef });
+    return interests;
+  });
+
   watch([activeKey, requestedSessionId], ([key, requestedId]) => {
     syncActiveState(key, requestedId || null);
     if (requestedId) void hydrateExistingSession(activeState.value, requestedId);
   }, { immediate: true });
 
   onUnmounted(() => {
+    // Transfer/remount in the same turn does not leave a delivery gap.
+    setTimeout(releaseEventInterests, 0);
     unsubscribeStreamEvents();
     unsubscribeAsyncTaskUpdates();
     unsubscribeExecutionState();

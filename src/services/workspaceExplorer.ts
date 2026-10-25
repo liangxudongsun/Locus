@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import { flushWindowEventInterests, watchWindowEventInterests } from "./windowEventInterests";
 import { beginWorkspaceGitHeadObservation, rememberWorkspaceGitHead } from "./workspaceGitHead";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 import {
@@ -63,7 +64,35 @@ export interface WorkspaceFileChangedPayload {
   path: string;
   kind: "upsert" | "delete";
   source: "os_watcher" | "locus_write" | "plugin_install" | "reconcile";
+  /** Reconcile this path's subtree; "." means the entire checkout. */
   rescan?: boolean;
+}
+
+function normalizeChangePath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^(?:\.\/)+/, "").replace(/\/+$/, "").toLowerCase() || ".";
+}
+
+/**
+ * Whether a `workspace-file-changed` path can affect `target`.
+ *
+ * A change can name a directory without separate events for its descendants:
+ * a watcher overflow rescans a subtree, and a directory delete or rename
+ * arrives once. "." covers the whole checkout. `target` is workspace-relative;
+ * pass `{ anchored: false }` when it may carry a root prefix (an absolute path),
+ * which then matches the change as a path-segment suffix or infix. Matching is
+ * case-insensitive: an extra refresh is harmless, a missed one shows stale data.
+ */
+export function workspaceChangeAffectsPath(
+  changedPath: string,
+  target: string,
+  options: { anchored?: boolean } = {},
+): boolean {
+  const changed = normalizeChangePath(changedPath);
+  if (changed === ".") return true;
+  const normalizedTarget = normalizeChangePath(target);
+  if (normalizedTarget === changed || normalizedTarget.startsWith(`${changed}/`)) return true;
+  return options.anchored === false
+    && (normalizedTarget.endsWith(`/${changed}`) || normalizedTarget.includes(`/${changed}/`));
 }
 
 type WorkspaceFileChangedEvent = RoutedWorkspaceEvent<WorkspaceFileChangedPayload>;
@@ -224,13 +253,31 @@ export function workspaceFileRevision(
   });
 }
 
+/**
+ * File changes are delivered only to windows that registered the checkout, so
+ * a consumer must name the checkout(s) it shows. Without `workspaceRef` it
+ * only sees checkouts that another consumer in this window registered.
+ */
 export async function subscribeWorkspaceFileChanges(
   handler: (event: WorkspaceFileChangedEvent) => void,
+  workspaceRef?: () => WorkspaceRef | readonly WorkspaceRef[] | null | undefined,
 ): Promise<RuntimeUnsubscribe> {
+  const releaseInterest = workspaceRef ? watchWindowEventInterests(() => {
+    const scope = workspaceRef();
+    const scopes: readonly WorkspaceRef[] = !scope ? [] : Array.isArray(scope) ? scope : [scope as WorkspaceRef];
+    return scopes.map(item => ({ workspaceRef: item }));
+  }) : () => {};
   workspaceFileChangeListeners.add(handler);
-  try { await ensureWorkspaceFileChangeSubscription(); }
-  catch (error) { workspaceFileChangeListeners.delete(handler); throw error; }
+  try {
+    await ensureWorkspaceFileChangeSubscription();
+    if (workspaceRef) await flushWindowEventInterests();
+  } catch (error) {
+    releaseInterest();
+    workspaceFileChangeListeners.delete(handler);
+    throw error;
+  }
   return () => {
+    releaseInterest();
     workspaceFileChangeListeners.delete(handler);
   };
 }

@@ -70,6 +70,24 @@ describe("invalidateDiffCacheForFiles", () => {
     expect(ipcInvokeMock).toHaveBeenCalledTimes(2);
   });
 
+  it("drops every cached diff below a changed directory, rescan root or the whole checkout", async () => {
+    // A watcher overflow is reported once for the covering directory, and a
+    // directory delete or rename once for the directory itself.
+    const nested = request("Flood/Sub/File.cs");
+    const sibling = request("FloodSibling/File.cs");
+    const elsewhere = request("Other/File.cs");
+    for (const item of [nested, sibling, elsewhere]) await diffSingleFile(item);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(3);
+
+    invalidateDiffCacheForFiles(["Flood"]);
+    for (const item of [nested, sibling, elsewhere]) await diffSingleFile(item);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(4);
+
+    invalidateDiffCacheForFiles(["."]);
+    for (const item of [nested, sibling, elsewhere]) await diffSingleFile(item);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(7);
+  });
+
   it("ignores an empty path list", async () => {
     const target = request("Assets/Stable.cs");
     await diffSingleFile(target);
@@ -95,6 +113,22 @@ describe("invalidateDiffCacheForFiles", () => {
     expect(ipcInvokeMock).toHaveBeenCalledTimes(2);
     await diffSingleFile(target, previous);
     expect(ipcInvokeMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not restore a stale cache entry after an in-flight preview was invalidated", async () => {
+    const target = request("Assets/InFlight.cs");
+    const scope = { checkoutId: "inflight-checkout", expectedGeneration: 1 };
+    let finish!: () => void;
+    ipcInvokeMock.mockImplementationOnce(() => new Promise(resolve => {
+      finish = () => resolve({ key: computeRequestKey(target, scope), filePath: target.filePath });
+    }));
+    const pending = diffSingleFile(target, scope);
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    invalidateDiffCacheForFiles([target.filePath], scope);
+    finish();
+    await pending;
+    await diffSingleFile(target, scope);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(2);
   });
 
   it("namespaces identical relative paths by checkout generation", async () => {

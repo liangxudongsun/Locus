@@ -210,6 +210,31 @@ describe("window workspace event ownership", () => {
     hub.dispose();
   });
 
+  it("records one trace per event with its delivery targets and filters snapshots by time", async () => {
+    const { hub, emit } = harness();
+    const subscriptions = ["pane-a", "pane-b", "pane-c"].map((owner) => hub.subscribe(vi.fn(), { owner }));
+    await Promise.all(subscriptions.map((subscription) => subscription.ready));
+    hub.setDiagnosticsEnabled(true);
+    const clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(1_000);
+    emit(event({ streamRevision: 1 }));
+    clock.mockReturnValue(2_000);
+    emit(event({ streamRevision: 2 }));
+
+    const traces = hub.snapshot().traces;
+    expect(traces).toHaveLength(2);
+    expect(traces.every((trace) => trace.action === "receive")).toBe(true);
+    expect(traces[0]).toMatchObject({
+      timestampMs: 1_000,
+      subscriptionIds: subscriptions.map((subscription) => subscription.id),
+      dispatchMs: expect.any(Number),
+    });
+    expect(hub.snapshot({ sinceMs: 1_500 }).traces.map((trace) => trace.envelope?.streamRevision)).toEqual([2]);
+    traces[0].subscriptionIds!.push(999);
+    expect(hub.snapshot().traces[0]?.subscriptionIds).toHaveLength(3);
+    hub.dispose();
+  });
+
   it("routes runtime and direct adapters through the same native subscription", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: { invoke: vi.fn() } });
     let dispatch!: (value: Event<WorkspaceEvent>) => void;

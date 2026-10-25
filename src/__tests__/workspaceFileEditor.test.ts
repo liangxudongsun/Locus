@@ -19,7 +19,8 @@ const workspaceExplorerMocks = vi.hoisted(() => ({
   editorFocus: vi.fn(),
 }));
 
-vi.mock("../services/workspaceExplorer", () => ({
+vi.mock("../services/workspaceExplorer", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/workspaceExplorer")>()),
   projectExplorerPreviewFile: workspaceExplorerMocks.preview,
   projectExplorerFileRevision: workspaceExplorerMocks.revision,
   projectExplorerWriteFile: workspaceExplorerMocks.write,

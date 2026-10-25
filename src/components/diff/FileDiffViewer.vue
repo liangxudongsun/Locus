@@ -709,7 +709,7 @@ onMounted(() => {
   void subscribeWorkspaceFileChanges((event) => {
     if (!workspaceFileChangeMatches(event, props.workspaceRef, props.payload.filePath)) return;
     sourceChanged.value = true;
-  }).then((release) => {
+  }, () => props.workspaceRef).then((release) => {
     if (diffViewerUnmounted) release();
     else releaseWorkspaceFileChanges = release;
   });

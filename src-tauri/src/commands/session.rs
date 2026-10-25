@@ -2849,6 +2849,7 @@ pub async fn load_session_view(
     session_id: String,
     message_limit: Option<u32>,
     synchronize_remote: Option<bool>,
+    app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     pending_input_queue: State<'_, PendingInputQueueHandle>,
     active_tasks: State<'_, ActiveTasks>,
@@ -2859,6 +2860,25 @@ pub async fn load_session_view(
             Err(error) => Some(remote_history_sync_warning(error)),
         }
     } else { None };
+    // Cut the live state before reading the transcript. Stream events at or
+    // below `stream_revision` are in this runtime snapshot, and an event's
+    // persisted effects are committed before it is published, so the
+    // transcript read below includes them too. The client replays the buffered
+    // events above the cut, which this view does not contain.
+    let active_run_id = active_task_run_id(active_tasks.inner(), &session_id).await;
+    let read_runtime = || {
+        active_run_id.as_deref().map(|run_id| {
+            runtime_snapshot_for_active_task(store.inner().as_ref(), &session_id, run_id)
+        })
+    };
+    let (runtime, stream_revision) =
+        match app_handle.try_state::<Arc<crate::workspace_service::ProjectRegistry>>() {
+            Some(registry) => {
+                let (runtime, revision) = registry.event_router().read_at_revision(read_runtime);
+                (runtime, Some(revision))
+            }
+            None => (read_runtime(), None),
+        };
     let store_handle = store.inner().clone();
     let load_session_id = session_id.clone();
     let limit = message_limit.unwrap_or(DEFAULT_SESSION_VIEW_MESSAGE_LIMIT);
@@ -2877,6 +2897,7 @@ pub async fn load_session_view(
     .map_err(AppError::from)?;
 
     snapshot.remote_sync_warning = remote_sync_warning;
+    snapshot.stream_revision = stream_revision;
     snapshot.session.pending_inputs = pending_input_queue
         .lock()
         .map_err(|error| {
@@ -2888,9 +2909,7 @@ pub async fn load_session_view(
             .operation("loadSessionView")
         })?
         .list_session(&session_id);
-    if let Some(run_id) = active_task_run_id(active_tasks.inner(), &session_id).await {
-        let mut runtime =
-            runtime_snapshot_for_active_task(store.inner().as_ref(), &session_id, &run_id);
+    if let (Some(run_id), Some(mut runtime)) = (active_run_id, runtime) {
         runtime.compact_queued = pending_input_queue
             .lock()
             .map_err(|error| {

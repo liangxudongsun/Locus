@@ -39,6 +39,7 @@ import type {
 } from "../types";
 import { listenWorkspaceEvent } from "../services/workspaceEventHub";
 import { useWorkspaceEventScope } from "./useWorkspaceEventScope";
+import { workspaceFileChangeInScope } from "./useFileChangeRevalidation";
 
 interface AssetProps {
   workingDir: string;
@@ -181,6 +182,8 @@ export function useAssetState(props: AssetProps) {
   let explorerInitialization = 0;
   let explorerInitializing = false;
   const pendingExplorerFileChanges = new Map<string, WorkspaceFileChangedPayload["kind"]>();
+  // Rescanned paths: their loaded descendants change without separate events.
+  const pendingExplorerSubtrees = new Set<string>();
   let explorerFileChangeTimer: ReturnType<typeof setTimeout> | null = null;
   let explorerFileChangeFlushing = false;
   let releaseFileWatch: (() => Promise<void>) | null = null;
@@ -279,11 +282,13 @@ export function useAssetState(props: AssetProps) {
     explorerFileChangeTimer = setTimeout(() => {
       explorerFileChangeTimer = null;
       const changes = [...pendingExplorerFileChanges.entries()];
+      const subtrees = new Set(pendingExplorerSubtrees);
       pendingExplorerFileChanges.clear();
+      pendingExplorerSubtrees.clear();
       explorerFileChangeFlushing = true;
       void (async () => {
-        if (watchesGeneralFiles.value || changes.some(([path]) => path === WORKSPACE_ROOT_PATH)) {
-          await reconcileFileTree(changes.map(([path]) => path));
+        if (watchesGeneralFiles.value || subtrees.size || changes.some(([path]) => path === WORKSPACE_ROOT_PATH)) {
+          await reconcileFileTree(changes.map(([path]) => path), subtrees);
         }
         else for (const [changedPath, changedKind] of changes) await applyExplorerFileChange(changedPath, changedKind);
       })().catch(e => { error.value = normalizeAppError(e).message; }).finally(() => {
@@ -296,13 +301,16 @@ export function useAssetState(props: AssetProps) {
   function scheduleExplorerFileChange(
     path: string,
     kind: WorkspaceFileChangedPayload["kind"],
+    subtree = false,
   ): void {
     if (explorerPathHidden(path)) return;
     if (watchesGeneralFiles.value && pendingExplorerFileChanges.size >= 4096) {
       pendingExplorerFileChanges.clear();
+      pendingExplorerSubtrees.clear();
       pendingExplorerFileChanges.set(WORKSPACE_ROOT_PATH, "upsert");
     }
     if (!pendingExplorerFileChanges.has(WORKSPACE_ROOT_PATH)) {
+      if (subtree) pendingExplorerSubtrees.add(path.replace(/\\/g, "/"));
       pendingExplorerFileChanges.set(path.replace(/\\/g, "/"), kind);
     }
     armExplorerFileChangeFlush();
@@ -315,6 +323,7 @@ export function useAssetState(props: AssetProps) {
     if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
     explorerFileChangeTimer = null;
     pendingExplorerFileChanges.clear();
+    pendingExplorerSubtrees.clear();
     invalidatePreviewSession();
     explorerTree.value = [];
     expandedPaths.value = new Set();
@@ -366,7 +375,7 @@ export function useAssetState(props: AssetProps) {
 
   /** Re-read only affected loaded directories. Keep folder objects so expansion,
    * nested caches and drag/reorder references survive a structural change. */
-  async function reconcileFileTree(paths: string[]) {
+  async function reconcileFileTree(paths: string[], subtrees: ReadonlySet<string> = new Set()) {
     const initialization = explorerInitialization;
     const reference = props.workspaceRef;
     if (!reference) return;
@@ -382,7 +391,11 @@ export function useAssetState(props: AssetProps) {
     else for (const path of paths) {
       if (explorerPathHidden(path)) continue;
       const changed = findNodeByPath(path);
-      if (changed?.kind === "folder" && changed.loaded) directories.add(changed);
+      if (changed?.kind === "folder" && changed.loaded) {
+        directories.add(changed);
+        // A rescanned subtree reports no separate events for its descendants.
+        if (subtrees.has(path)) collect(changed.children);
+      }
       let parentPath = explorerParentPath(path);
       while (true) {
         const parent = findNodeByPath(parentPath);
@@ -1246,16 +1259,12 @@ export function useAssetState(props: AssetProps) {
   function ensureFileChangeListener(): Promise<void> {
     if (fileChangeListenerStarting) return fileChangeListenerStarting;
     fileChangeListenerStarting = subscribeWorkspaceFileChanges((event) => {
-      const workspaceRef = props.workspaceRef;
-      if (!workspaceRef || event.checkoutId !== workspaceRef.checkoutId) return;
-      if (
-        workspaceRef.expectedGeneration != null
-        && event.workspaceGeneration !== workspaceRef.expectedGeneration
-      ) return;
-      if (workspaceRef.expectedMaterializationEpoch != null && event.materializationEpoch != null
-        && workspaceRef.expectedMaterializationEpoch !== event.materializationEpoch) return;
-      scheduleExplorerFileChange(event.payload.rescan ? WORKSPACE_ROOT_PATH : event.payload.path, event.payload.kind);
-    }).then(release => {
+      if (!workspaceFileChangeInScope(event, props.workspaceRef)) return;
+      if (explorerPathHidden(event.payload.path)) return;
+      // A watcher overflow names the narrowest directory covering it ("." for
+      // the whole checkout); only that subtree is reconciled.
+      scheduleExplorerFileChange(event.payload.path, event.payload.kind, !!event.payload.rescan);
+    }, () => props.workspaceRef).then(release => {
       if (assetStateUnmounted) release();
       else releaseWorkspaceFileChanges = release;
     }).catch(error => { fileChangeListenerStarting = null; throw error; });
@@ -1367,6 +1376,7 @@ export function useAssetState(props: AssetProps) {
     if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
     explorerFileChangeTimer = null;
     pendingExplorerFileChanges.clear();
+    pendingExplorerSubtrees.clear();
     stopWatcherPoll();
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
     releaseSelectionLock?.();

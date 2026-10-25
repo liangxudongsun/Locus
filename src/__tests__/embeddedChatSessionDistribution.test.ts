@@ -9,6 +9,7 @@ import {
   publishSessionContentChange,
   publishSessionStreamEvent,
 } from "../services/sessionStreamEventHub";
+import * as toolCollapseTrace from "../services/toolCollapseTrace";
 import { preloadEmbeddedChatSession, useEmbeddedChatSession } from "../composables/useEmbeddedChatSession";
 
 const mocks = vi.hoisted(() => ({
@@ -531,6 +532,120 @@ describe("embedded chat session distribution", () => {
     expect(mocks.tauriListen).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("constructs streaming trace details only when enabled (%s)", async (enabled) => {
+    const sessionId = `trace-hot-path-${enabled}`;
+    const runId = `${sessionId}-run`;
+    mocks.loadSession.mockResolvedValue({
+      id: sessionId, title: "Large session", sessionType: "chat", parentSessionId: null,
+      createdAt: 1, updatedAt: 1,
+      messages: Array.from({ length: 120 }, (_, index) => ({
+        id: `history-${index}`, role: "assistant", content: "Large history text. ".repeat(1000), createdAt: 1,
+      })),
+      pendingInputs: [],
+    });
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const app = createApp(defineComponent({ setup() {
+      session = useEmbeddedChatSession({
+        sessionKey: sessionId, initialSessionId: sessionId,
+        workspaceRef: { checkoutId: "trace-checkout", expectedGeneration: 1 },
+        selectedModelId: "model-a", buildRequest: text => ({ text }),
+      });
+      return () => h("div");
+    } }));
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(session.isLoading.value).toBe(false));
+    sessionStorage.setItem("locus.toolCollapseTraceEnabled", String(enabled));
+    sessionStorage.setItem("locus.toolCollapseTrace", "all");
+    toolCollapseTrace.resetToolCollapseTraceCacheForTest();
+    const previews = vi.spyOn(toolCollapseTrace, "previewTraceText");
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    let revision = 0;
+    const emit = (event: import("../types").StreamEvent) => publishSessionStreamEvent({ event, source: {
+      kind: "workspace", projectId: "trace-project", checkoutId: "trace-checkout",
+      workspaceGeneration: 1, streamRevision: ++revision,
+    } });
+    try {
+      emit({ type: "runStart", sessionId, runId });
+      previews.mockClear();
+      for (let index = 0; index < 20; index++) {
+        emit({ type: "textDelta", sessionId, runId, text: "delta", partId: "text", renderSeq: 1 });
+      }
+      if (enabled) {
+        expect(previews.mock.calls.length).toBeGreaterThanOrEqual(120 * 2 * 20);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining("streamEventMutationBatch"), expect.objectContaining({
+          messageCount: 120, messages: expect.any(Array),
+        }));
+      } else {
+        expect(previews).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+      }
+      previews.mockClear();
+      emit({ type: "toolCallStart", sessionId, runId, toolCallId: "tool", toolName: "read", arguments: "{}", partId: "tool", renderSeq: 2 });
+      emit({ type: "userMessage", sessionId, runId, message: { id: "deferred", role: "user", content: "Queued while tool runs", createdAt: 2 } });
+      expect(session.messages.value.some(message => message.id === "deferred")).toBe(false);
+      emit({ type: "toolCallRoundDone", sessionId, runId, messageId: "tool-round", fullText: "done", toolCalls: [] });
+      expect(session.messages.value.some(message => message.id === "deferred")).toBe(true);
+      if (!enabled) expect(previews).not.toHaveBeenCalled();
+      else expect(log).toHaveBeenCalledWith(expect.stringContaining("embeddedFlushDeferredUserMessages"), expect.objectContaining({
+        messagesBeforeFlush: expect.any(Array), messagesAfterFlush: expect.any(Array),
+      }));
+    } finally {
+      previews.mockRestore(); log.mockRestore(); app.unmount();
+      sessionStorage.removeItem("locus.toolCollapseTraceEnabled");
+      sessionStorage.removeItem("locus.toolCollapseTrace");
+      toolCollapseTrace.resetToolCollapseTraceCacheForTest();
+    }
+  });
+
+  it("hands a mid-stream load over at its stream revision without gaps or duplicates", async () => {
+    const sessionId = "handoff-session";
+    const runId = "handoff-run";
+    let resolveView: ((view: unknown) => void) | undefined;
+    mocks.loadSessionView.mockImplementation(() => new Promise((resolve) => { resolveView = resolve; }));
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const app = createApp(defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: "handoff-pane",
+          initialSessionId: sessionId,
+          workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 3 },
+          selectedModelId: "model-a",
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    }));
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(resolveView).toBeTypeOf("function"));
+    const delta = (text: string, streamRevision: number) => publishSessionStreamEvent({
+      event: { type: "textDelta", sessionId, runId, text },
+      source: { kind: "workspace", projectId: "project-a", checkoutId: "checkout-a", workspaceGeneration: 3, streamRevision },
+    });
+    // Published while the view loads; the snapshot is cut at revision 12, so
+    // C and D are already in it and E and F are not.
+    delta("C", 11); delta("D", 12); delta("E", 13); delta("F", 14);
+    resolveView!({
+      session: {
+        id: sessionId, title: "Handoff", sessionType: "chat", parentSessionId: null,
+        createdAt: 1, updatedAt: 1, messages: [], pendingInputs: [],
+        runtime: {
+          activeRun: { runId, sessionId, status: "running", startedAt: 1, updatedAt: 1 },
+          streamingText: "ABCD", activeToolCalls: [], pendingToolConfirms: [], isCompacting: false,
+        },
+      },
+      streamRevision: 12,
+      userMessageIds: [],
+      oldestMessageRowId: null,
+      hasMoreHistory: false,
+    });
+    await vi.waitFor(() => expect(session.isStreaming.value).toBe(true));
+    // The rendered text is throttled; it must settle on exactly the full stream.
+    await vi.waitFor(() => expect(session.streamingText.value).toBe("ABCDEF"));
+    delta("G", 15);
+    await vi.waitFor(() => expect(session.streamingText.value).toBe("ABCDEFG"));
+    app.unmount();
+  });
+
   it("reduces a session event once while two panes observe the same durable session", async () => {
     const sessionId = "shared-session-distribution";
     const runId = "shared-run-distribution";
@@ -1031,6 +1146,8 @@ describe("embedded chat session distribution", () => {
     const sending = session.send();
     await session.cancel();
     expect(mocks.cancelChat).not.toHaveBeenCalled();
+    // Launch waits for the renderer's delivery interests to be acknowledged.
+    await vi.waitFor(() => expect(resolveLaunch).toBeTypeOf("function"));
 
     resolveLaunch({ sessionId: "cancel-session", runId: "cancel-run" });
     await sending;
@@ -1471,7 +1588,7 @@ describe("embedded chat session distribution", () => {
     mocks.loadSession.mockResolvedValue(loadedSession(sessionId, "Preloaded transcript"));
     preloadEmbeddedChatSession(sessionId, workspaceRef);
     preloadEmbeddedChatSession(sessionId, workspaceRef);
-    expect(mocks.loadSessionView).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(mocks.loadSessionView).toHaveBeenCalledTimes(1));
     expect(mocks.getTodos).toHaveBeenCalledTimes(1);
     const { app, session } = mountSession(sessionId, workspaceRef);
     try {

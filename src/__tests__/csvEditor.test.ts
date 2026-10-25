@@ -11,7 +11,8 @@ import { t } from "../i18n";
 
 const mocks = vi.hoisted(() => ({ read: vi.fn(), write: vi.fn(), revision: vi.fn(), readView: vi.fn(), writeView: vi.fn(),
   rows: [1], fileListeners: new Set<(event: never) => void>() }));
-vi.mock("../services/workspaceExplorer", () => ({
+vi.mock("../services/workspaceExplorer", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/workspaceExplorer")>()),
   projectExplorerPreviewFile: mocks.read, workspaceFilePreview: mocks.read,
   projectExplorerWriteFile: mocks.write, workspaceFileWrite: mocks.write,
   projectExplorerFileRevision: mocks.revision, workspaceFileRevision: mocks.revision,

@@ -136,7 +136,7 @@ watch([identity, hiddenRoots], () => { void refreshRoots(); }, { immediate: true
 for (const subscription of [
   subscribeWorkspaceFileChanges(event => {
     if (event.checkoutId === props.workspaceRef.checkoutId) scheduleRefresh();
-  }),
+  }, () => props.workspaceRef),
   subscribeExplorerFileActions(event => { if (rootKey(event.root) === rootKey(props.workingDir)) scheduleRefresh(); }),
 ]) void subscription.then(release => { if (disposed) release(); else releases.push(release); }).catch(() => {});
 onBeforeUnmount(() => { disposed = true; generation++; clearTimeout(refreshTimer); releases.forEach(release => release()); });

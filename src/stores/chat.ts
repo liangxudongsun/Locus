@@ -1,4 +1,5 @@
-import { ref, computed, markRaw } from "vue";
+import { ref, computed, markRaw, onScopeDispose } from "vue";
+import { flushWindowEventInterests, watchWindowEventInterests, type WindowEventInterest } from "../services/windowEventInterests";
 import { defineStore } from "pinia";
 import { useModelStore } from "./model";
 import { useAgentStore } from "./agent";
@@ -422,6 +423,19 @@ export const useChatStore = defineStore("chat", () => {
       && !isStreaming.value
       && (sessionResumeAvailable.value.get(sessionId) ?? false);
   });
+
+  const releaseEventInterests = watchWindowEventInterests(() => {
+    const interests: WindowEventInterest[] = [];
+    for (const sessionId of [activeSessionId.value, pendingSelectionSessionId.value]) {
+      if (sessionId) interests.push({ sessionId });
+    }
+    if (isStreaming.value && !activeSessionId.value) {
+      const workspaceRef = captureFocusedWorkspaceRef();
+      if (workspaceRef) interests.push({ streamWorkspaceRef: workspaceRef });
+    }
+    return interests;
+  });
+  onScopeDispose(releaseEventInterests);
 
   function setSessionResumeAvailable(sessionId: string, available: boolean) {
     const next = new Map(sessionResumeAvailable.value);
@@ -1191,8 +1205,19 @@ export const useChatStore = defineStore("chat", () => {
     if (commitSelection) {
       pendingSelectionSessionId.value = id;
     }
+    // Hold this session's live events until its snapshot is applied, then
+    // apply only those above the snapshot's stream revision.
+    beginSessionLoadDeferral(id, loadSeq);
+    let appliedSnapshot: { streamRevision: number | null } | null = null;
+    let handoffDone = false;
+    const finishHandoff = () => {
+      if (handoffDone) return;
+      handoffDone = true;
+      finishSessionLoadDeferral(id, loadSeq, appliedSnapshot);
+    };
 
     try {
+      await flushWindowEventInterests();
       const messageLimit = useDisplaySettings().state.sessionMessagePageSize;
       const [snapshot, resumeAvailable] = await Promise.all([
         synchronizeRemote === undefined ? sessionService.loadSessionView(id, messageLimit)
@@ -1248,6 +1273,8 @@ export const useChatStore = defineStore("chat", () => {
       );
       setSessionResumeAvailable(detail.id, resumeAvailable);
       applySessionPrimaryData(detail);
+      appliedSnapshot = { streamRevision: snapshot.streamRevision ?? null };
+      finishHandoff();
       if (!detail.lastEffort) {
         void useModelStore().loadLastEffort();
       }
@@ -1279,6 +1306,8 @@ export const useChatStore = defineStore("chat", () => {
         pendingSelectionSessionId.value = null;
       }
       return false;
+    } finally {
+      finishHandoff();
     }
   }
 
@@ -1922,8 +1951,64 @@ export const useChatStore = defineStore("chat", () => {
     }));
   }
 
+  // -- Session load / live stream handoff --
+  interface DeferredStreamEvent { event: StreamEvent; streamRevision: number | null }
+  /** Session view loads in flight. A loaded view replaces the session's stream
+   * state with a snapshot cut at a stream revision: it reflects every event at
+   * or below that revision and none above it. While a load is in flight the
+   * session's reducer events are held, and once its snapshot is applied only
+   * the held events above the cut are applied, each exactly once. Bookkeeping
+   * (run tracking, notifications) still runs when an event arrives. */
+  const sessionLoadDeferrals = new Map<string, { loads: Set<number>; events: DeferredStreamEvent[] }>();
+
+  function beginSessionLoadDeferral(sessionId: string, loadSeq: number): void {
+    const deferral = sessionLoadDeferrals.get(sessionId) ?? { loads: new Set<number>(), events: [] };
+    deferral.loads.add(loadSeq);
+    sessionLoadDeferrals.set(sessionId, deferral);
+  }
+
+  /** `applied` is the cut of the snapshot this load applied, or null when it
+   * applied none (failed or superseded) and the live state is still current. */
+  function finishSessionLoadDeferral(
+    sessionId: string,
+    loadSeq: number,
+    applied: { streamRevision: number | null } | null,
+  ): void {
+    const deferral = sessionLoadDeferrals.get(sessionId);
+    if (!deferral || !deferral.loads.delete(loadSeq)) return;
+    const cut = applied?.streamRevision;
+    if (cut != null) {
+      deferral.events = deferral.events.filter(
+        (item) => item.streamRevision != null && item.streamRevision > cut,
+      );
+    }
+    // Without a cut the held events cannot be placed against the snapshot;
+    // applying them keeps their lifecycle effects (streamed text may repeat).
+    // A newer load of this session owns the held events; its cut is later.
+    if (deferral.loads.size > 0) return;
+    sessionLoadDeferrals.delete(sessionId);
+    if (sessionId !== activeSessionId.value) return;
+    // Isolate each event, as live dispatch does: one failure must not drop the
+    // rest of the stream or fail the load that already applied its snapshot.
+    for (const { event } of deferral.events) {
+      try {
+        applyActiveSessionStreamEvent(event, terminalPendingUserMessageFor(event));
+      } catch (error) {
+        console.error("[chat] failed to apply a stream event held during a session load", error);
+      }
+    }
+  }
+
+  function terminalPendingUserMessageFor(event: StreamEvent) {
+    const pending = event.type === "error" || event.type === "cancelled"
+      ? messages.value.filter(isLocalPendingUserMessage)
+      : [];
+    return pending[pending.length - 1];
+  }
+
   // -- Stream event handler --
-  function handleStreamEvent(event: StreamEvent): boolean {
+  /** `streamRevision` is the workspace event stream revision of a routed event. */
+  function handleStreamEvent(event: StreamEvent, streamRevision?: number | null): boolean {
     traceStoreOrder("streamEventReceived", () => ({
       event: traceStreamEvent(event),
       expectedRunId: sessionRunIds.value.get(event.sessionId)
@@ -1939,12 +2024,7 @@ export const useChatStore = defineStore("chat", () => {
         displayTextPreview: previewTraceText(input.displayText || input.text, 48),
       })),
     }));
-    const pendingUserMessagesAtTerminal = event.type === "error" || event.type === "cancelled"
-      ? messages.value.filter(isLocalPendingUserMessage)
-      : [];
-    const terminalPendingUserMessage = pendingUserMessagesAtTerminal[
-      pendingUserMessagesAtTerminal.length - 1
-    ];
+    const terminalPendingUserMessage = terminalPendingUserMessageFor(event);
 
     if (event.type === "runStart") {
       const compactSourceRunId = compactQueuedRuns.value.get(event.sessionId) ?? null;
@@ -2177,8 +2257,22 @@ export const useChatStore = defineStore("chat", () => {
       void useChatChangesStore().refresh(event.sessionId);
     }
 
+    // Only routed events carry a revision that can be placed against a cut;
+    // legacy events keep applying on arrival.
+    const loadDeferral = streamRevision != null ? sessionLoadDeferrals.get(event.sessionId) : undefined;
+    if (loadDeferral) {
+      loadDeferral.events.push({ event, streamRevision: streamRevision ?? null });
+      return true;
+    }
     if (event.sessionId !== activeSessionId.value) return true;
+    return applyActiveSessionStreamEvent(event, terminalPendingUserMessage);
+  }
 
+  /** Reducer for the active session's stream events; bookkeeping already ran. */
+  function applyActiveSessionStreamEvent(
+    event: StreamEvent,
+    terminalPendingUserMessage: ReturnType<typeof terminalPendingUserMessageFor>,
+  ): boolean {
     if (event.type === "claudeCodeNotice") {
       useNotificationStore().addNotice(event.notice.severity, event.notice.message, {
         code: event.notice.code,
@@ -2942,6 +3036,7 @@ export const useChatStore = defineStore("chat", () => {
     });
 
     try {
+      await flushWindowEventInterests();
       const { sessionId: sid, runId } = await sessionService.chat({
         workspaceRef: requestWorkspaceRef,
         sessionId: requestSessionId,
@@ -3081,6 +3176,7 @@ export const useChatStore = defineStore("chat", () => {
     });
 
     try {
+      await flushWindowEventInterests();
       const { sessionId: sid, runId } = await sessionService.chat({
         workspaceRef: requestWorkspaceRef,
         sessionId,
@@ -3241,6 +3337,7 @@ export const useChatStore = defineStore("chat", () => {
     });
 
     try {
+      await flushWindowEventInterests();
       const { sessionId: sid, runId } = await sessionService.chat({
         workspaceRef: requestWorkspaceRef,
         sessionId,

@@ -5,7 +5,8 @@ import { useFileChangeRevalidation } from "../composables/useFileChangeRevalidat
 import type { ProjectExplorerFileRevision } from "../types/workbench";
 
 const events = vi.hoisted(() => ({ listeners: new Set<(event: never) => void>() }));
-vi.mock("../services/workspaceExplorer", () => ({
+vi.mock("../services/workspaceExplorer", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/workspaceExplorer")>()),
   subscribeWorkspaceFileChanges: vi.fn(async (listener: (event: never) => void) => {
     events.listeners.add(listener); return () => events.listeners.delete(listener);
   }),

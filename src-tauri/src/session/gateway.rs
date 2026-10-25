@@ -223,8 +223,6 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
     #[cfg(debug_assertions)]
     warn_if_run_session_mismatch(store, run_id, &session_id, event_kind);
 
-    store.apply_runtime_stream_event(run_id, &event);
-
     let mut run_status =
         run_status_for_event(&event).map(|(status, error_message)| SessionRunStatusUpdate {
             run_id: run_id.to_string(),
@@ -278,12 +276,41 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
         app_handle.try_state::<std::sync::Arc<crate::workspace_service::ProjectRegistry>>(),
     ) {
         (Some(routed), Some(registry)) => {
-            registry
-                .event_router()
-                .publish(app_handle, "stream-event", routed);
+            // `load_session_view` cuts the runtime snapshot at a stream revision.
+            // Applying the event inside its publication section puts it in the
+            // snapshot exactly when its revision is at or below that cut, so a
+            // client replays the buffered events above it without gaps.
+            let outcome = registry.event_router().publish_applied(
+                app_handle,
+                "stream-event",
+                routed,
+                || store.apply_runtime_stream_event(run_id, &envelope.event),
+            );
+            if outcome != crate::workspace_service::event::WorkspaceEventPublishOutcome::PublishedScoped {
+                store.apply_runtime_stream_event(run_id, &envelope.event);
+            }
         }
         _ => {
-            let _ = app_handle.emit("stream-event", envelope);
+            store.apply_runtime_stream_event(run_id, &envelope.event);
+            // Historical runs without a checkout still have an exact session id.
+            let registry =
+                app_handle.try_state::<std::sync::Arc<crate::workspace_service::ProjectRegistry>>();
+            if let Some(registry) = registry.filter(|_| {
+                crate::workspace_service::event::is_high_frequency_stream_type(event_kind)
+            }) {
+                let windows = registry
+                    .event_router()
+                    .window_interests
+                    .legacy_stream_targets(&session_id);
+                let _ = crate::workspace_service::event::emit_to_interested_windows(
+                    app_handle,
+                    "stream-event",
+                    &envelope,
+                    windows,
+                );
+            } else {
+                let _ = app_handle.emit("stream-event", envelope);
+            }
         }
     }
 

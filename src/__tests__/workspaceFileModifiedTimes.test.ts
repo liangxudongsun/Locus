@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { effectScope, nextTick, ref } from "vue";
 import { useWorkspaceFileModifiedTimes, type WorkspaceFileTimeTarget } from "../composables/useWorkspaceFileModifiedTimes";
+import { subscribeWorkspaceFileChanges } from "../services/workspaceExplorer";
 import type { ProjectExplorerFileRevision } from "../types/workbench";
 
 const mocks = vi.hoisted(() => ({ revision: vi.fn(), release: vi.fn(), handlers: [] as Array<(event: any) => void> }));
-vi.mock("../services/workspaceExplorer", () => ({
+vi.mock("../services/workspaceExplorer", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/workspaceExplorer")>()),
   projectExplorerFileRevision: mocks.revision,
   subscribeWorkspaceFileChanges: vi.fn((handler) => { mocks.handlers.push(handler); return Promise.resolve(mocks.release); }),
 }));
@@ -54,6 +56,28 @@ describe("workspace file modified times", () => {
     mocks.revision.mockRejectedValueOnce(new Error("file unavailable"));
     fixture.tick.value++; await nextTick(); await flush();
     expect(fixture.times.modifiedAt(file)).toBeUndefined();
+  });
+
+  it("registers the displayed checkouts and refreshes rows below a changed directory", async () => {
+    const refs = [{ checkoutId: "checkout-p", expectedGeneration: 2, expectedMaterializationEpoch: 0 }];
+    const nested = { projectId: "p", path: "C:/work/docs/sub/a.md" };
+    const outside = { projectId: "p", path: "C:/work/notes/b.md" };
+    const files = ref([nested, outside]), scope = effectScope();
+    scope.run(() => useWorkspaceFileModifiedTimes(() => files.value, () => 0, undefined, () => refs));
+    cleanups.push(() => scope.stop());
+    await flush();
+    // File changes are only delivered for checkouts this window registered.
+    const scopeGetter = vi.mocked(subscribeWorkspaceFileChanges).mock.calls[0]![1] as () => unknown;
+    expect(scopeGetter()).toBe(refs);
+    mocks.revision.mockClear();
+    // A watcher overflow or directory delete names only the directory.
+    mocks.handlers[0]!({ projectId: "p", payload: { path: "docs", rescan: true } });
+    await flush();
+    expect(mocks.revision.mock.calls.map(([, path]) => path)).toEqual([nested.path]);
+    mocks.revision.mockClear();
+    mocks.handlers[0]!({ projectId: "p", payload: { path: ".", rescan: true } });
+    await flush();
+    expect(mocks.revision).toHaveBeenCalledTimes(2);
   });
 
   it("bounds concurrent reads and discards pending results after disposal", async () => {

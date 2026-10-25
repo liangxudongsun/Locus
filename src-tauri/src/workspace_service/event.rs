@@ -9,6 +9,64 @@ use super::identity::{CheckoutId, ProjectId, ServiceInstanceId};
 use super::runtime::ProjectRegistry;
 use super::service::ServiceRuntimeIdentity;
 
+mod window_interest;
+pub use window_interest::{
+    is_high_frequency_stream_type, WindowEventInterestRegistry, WindowEventInterests,
+};
+
+/// Global listeners in Tauri also receive `emit_to`. A separate event name is
+/// required to avoid delivering/parsing high-frequency payloads in other realms.
+pub fn window_event_name(event: &str, window: &str) -> String {
+    format!("{event}/{window}")
+}
+
+pub fn emit_to_interested_windows(
+    app: &AppHandle,
+    event: &str,
+    payload: &impl Serialize,
+    windows: Vec<String>,
+) -> Result<(), String> {
+    if windows.is_empty() {
+        return Ok(());
+    }
+    // Serialize once even when a session is open in several independent Apps.
+    let payload = serde_json::to_string(payload).map_err(|error| error.to_string())?;
+    let mut result = Ok(());
+    for window in windows {
+        if let Err(error) = app.emit_str_to(
+            window.as_str(),
+            &window_event_name(event, &window),
+            payload.clone(),
+        ) {
+            result = Err(error.to_string());
+        }
+    }
+    result
+}
+
+#[tauri::command]
+pub fn set_workspace_event_interests(
+    window: tauri::WebviewWindow,
+    registry: tauri::State<'_, Arc<ProjectRegistry>>,
+    interests: WindowEventInterests,
+) -> Result<(), String> {
+    if interests.checkouts.len() + interests.sessions.len() + interests.stream_checkouts.len()
+        > 4096
+    {
+        return Err("Too many workspace event interests".into());
+    }
+    let router = registry.event_router();
+    router.window_interests.replace(window.label(), interests);
+    if window
+        .app_handle()
+        .get_webview_window(window.label())
+        .is_none()
+    {
+        router.window_interests.remove(window.label());
+    }
+    Ok(())
+}
+
 /// Stable process-level event carrying every current workspace event together
 /// with its complete routing scope.
 pub const WORKSPACE_EVENT_NAME: &str = "locus://workspace-event";
@@ -92,6 +150,7 @@ pub struct WorkspaceEventRouter {
     subscribers: std::sync::Mutex<Vec<mpsc::UnboundedSender<RoutedWorkspaceEvent>>>,
     stream_revision: AtomicU64,
     publish_gate: std::sync::Mutex<()>,
+    pub window_interests: WindowEventInterestRegistry,
 }
 
 impl WorkspaceEventRouter {
@@ -101,6 +160,7 @@ impl WorkspaceEventRouter {
             subscribers: std::sync::Mutex::new(Vec::new()),
             stream_revision: AtomicU64::new(0),
             publish_gate: std::sync::Mutex::new(()),
+            window_interests: WindowEventInterestRegistry::default(),
         })
     }
 
@@ -124,6 +184,25 @@ impl WorkspaceEventRouter {
         event_name: impl Into<String>,
         envelope: WorkspaceEventEnvelope<T>,
     ) -> WorkspaceEventPublishOutcome {
+        self.publish_applied(app_handle, event_name, envelope, || {})
+    }
+
+    /// Publish a scoped event and run `apply` inside the publication critical
+    /// section, after the event's revision is allocated and before any
+    /// delivery. State changed this way is cut consistently by
+    /// [`Self::read_at_revision`]: it reflects every applied event at or below
+    /// the returned revision and none above it, so a client can combine such a
+    /// snapshot with the buffered events above it without gaps or duplicates.
+    ///
+    /// `apply` runs exactly when the outcome is `PublishedScoped`; callers must
+    /// apply a dropped event themselves if its state still matters.
+    pub fn publish_applied<T: Serialize + Clone>(
+        &self,
+        app_handle: &AppHandle,
+        event_name: impl Into<String>,
+        envelope: WorkspaceEventEnvelope<T>,
+        apply: impl FnOnce(),
+    ) -> WorkspaceEventPublishOutcome {
         let Some(registry) = self
             .registry
             .read()
@@ -145,7 +224,18 @@ impl WorkspaceEventRouter {
             return WorkspaceEventPublishOutcome::DroppedStale;
         }
 
-        self.publish_current(app_handle, event_name.into(), envelope)
+        self.publish_current(app_handle, event_name.into(), envelope, apply)
+    }
+
+    /// Run `read` inside the publication critical section and return the last
+    /// allocated stream revision with its result. See [`Self::publish_applied`].
+    pub fn read_at_revision<R>(&self, read: impl FnOnce() -> R) -> (R, u64) {
+        let _publication = self
+            .publish_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let revision = self.stream_revision.load(Ordering::Relaxed);
+        (read(), revision)
     }
 
     /// Publish a non-`WorkspaceServiceHost` service event after its owning
@@ -174,7 +264,7 @@ impl WorkspaceEventRouter {
         if !Self::workspace_scope_is_current(&runtime, &envelope) {
             return WorkspaceEventPublishOutcome::DroppedStale;
         }
-        self.publish_current(app_handle, event_name.into(), envelope)
+        self.publish_current(app_handle, event_name.into(), envelope, || {})
     }
 
     fn publish_current<T: Serialize + Clone>(
@@ -182,6 +272,7 @@ impl WorkspaceEventRouter {
         app_handle: &AppHandle,
         event_name: String,
         envelope: WorkspaceEventEnvelope<T>,
+        apply: impl FnOnce(),
     ) -> WorkspaceEventPublishOutcome {
         // Serialize outside the publication critical section. Revision
         // allocation, WebView emission, and internal subscriber delivery are
@@ -198,19 +289,26 @@ impl WorkspaceEventRouter {
                 return WorkspaceEventPublishOutcome::DroppedSerialization;
             }
         };
-        self.publish_routed_with(routed, |routed| {
-            app_handle
-                .emit(WORKSPACE_EVENT_NAME, routed.clone())
-                .map_err(|error| error.to_string())
+        self.publish_routed_with(routed, apply, |routed| {
+            match self.window_interests.targets(routed) {
+                None => app_handle
+                    .emit(WORKSPACE_EVENT_NAME, routed)
+                    .map_err(|error| error.to_string()),
+                Some(windows) => {
+                    emit_to_interested_windows(app_handle, WORKSPACE_EVENT_NAME, routed, windows)
+                }
+            }
         })
     }
 
-    fn publish_routed_with<F>(
+    fn publish_routed_with<A, F>(
         &self,
         mut routed: RoutedWorkspaceEvent,
+        apply: A,
         emit: F,
     ) -> WorkspaceEventPublishOutcome
     where
+        A: FnOnce(),
         F: FnOnce(&RoutedWorkspaceEvent) -> Result<(), String>,
     {
         let _publication = self
@@ -219,6 +317,7 @@ impl WorkspaceEventRouter {
             .unwrap_or_else(|error| error.into_inner());
         let stream_revision = self.next_stream_revision();
         routed.stream_revision = stream_revision;
+        apply();
 
         if let Err(error) = emit(&routed) {
             tracing::warn!(
@@ -297,7 +396,8 @@ impl WorkspaceEventRouter {
         if runtime.generation() != envelope.workspace_generation
             || super::scope::WorkspaceRef::new(envelope.checkout_id.clone(), None)
                 .with_materialization_epoch(envelope.materialization_epoch)
-                .validate_materialization_epoch(runtime.materialization_epoch()).is_err()
+                .validate_materialization_epoch(runtime.materialization_epoch())
+                .is_err()
             || runtime.project_id() != &envelope.project_id
             || runtime.checkout_id() != &envelope.checkout_id
         {
@@ -360,7 +460,10 @@ mod tests {
         assert!(WorkspaceEventRouter::scope_is_current(&runtime, &envelope));
         let mut previous_assignment = envelope.clone();
         previous_assignment.materialization_epoch = Some(runtime.materialization_epoch() + 1);
-        assert!(!WorkspaceEventRouter::scope_is_current(&runtime, &previous_assignment));
+        assert!(!WorkspaceEventRouter::scope_is_current(
+            &runtime,
+            &previous_assignment
+        ));
         let mut stale = envelope.clone();
         stale.workspace_generation = envelope.workspace_generation.saturating_sub(1);
         assert_ne!(stale.workspace_generation, envelope.workspace_generation);
@@ -425,7 +528,10 @@ mod tests {
             envelope.workspace_generation
         );
         assert_eq!(serialized["serviceGeneration"], 7);
-        assert_eq!(serialized["materializationEpoch"], runtime.materialization_epoch());
+        assert_eq!(
+            serialized["materializationEpoch"],
+            runtime.materialization_epoch()
+        );
         assert_eq!(serialized["payload"]["status"], "ready");
         assert!(serialized.get("envelope").is_none());
     }
@@ -466,7 +572,7 @@ mod tests {
                         },
                     };
                     barrier.wait();
-                    let outcome = router.publish_routed_with(routed, |event| {
+                    let outcome = router.publish_routed_with(routed, || {}, |event| {
                         // Make the first publisher selected by the scheduler
                         // hold the emitter briefly; later publishers must stay
                         // behind its revision and delivery.
@@ -495,6 +601,62 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(received, emitted);
+    }
+
+    #[test]
+    fn applied_state_is_cut_exactly_at_the_read_revision() {
+        // A reader must never observe applied state for an event whose revision
+        // is above the cut, nor miss one at or below it, under any interleaving.
+        let router = WorkspaceEventRouter::new();
+        let applied = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let max_applied_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let routed = || RoutedWorkspaceEvent {
+            event_name: "stream-event".to_string(),
+            stream_revision: 0,
+            envelope: WorkspaceEventEnvelope {
+                project_id: ProjectId::new("cut-project").expect("project id"),
+                checkout_id: CheckoutId::new("cut-checkout").expect("checkout id"),
+                workspace_generation: 1,
+                materialization_epoch: None,
+                service_instance_id: None,
+                service_generation: None,
+                payload: serde_json::json!({}),
+            },
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let router = Arc::clone(&router);
+                let applied = Arc::clone(&applied);
+                let max_applied_revision = Arc::clone(&max_applied_revision);
+                scope.spawn(move || {
+                    for _ in 0..500 {
+                        router.publish_routed_with(
+                            routed(),
+                            || {
+                                applied.fetch_add(1, Ordering::SeqCst);
+                            },
+                            |event| {
+                                max_applied_revision.fetch_max(event.stream_revision, Ordering::SeqCst);
+                                Ok(())
+                            },
+                        );
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let router = Arc::clone(&router);
+                let applied = Arc::clone(&applied);
+                scope.spawn(move || {
+                    for _ in 0..2000 {
+                        let (count, revision) =
+                            router.read_at_revision(|| applied.load(Ordering::SeqCst));
+                        assert_eq!(count, revision, "applied state must match the cut revision");
+                    }
+                });
+            }
+        });
+        assert_eq!(applied.load(Ordering::SeqCst), 4000);
+        assert_eq!(max_applied_revision.load(Ordering::SeqCst), 4000);
     }
 
     #[test]

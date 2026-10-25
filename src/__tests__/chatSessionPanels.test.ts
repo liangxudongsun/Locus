@@ -589,6 +589,43 @@ describe("chat session panel state", () => {
     });
   });
 
+  it("switches into a running session without losing or repeating deltas published during the load", async () => {
+    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1));
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    onTestFinished(() => { vi.unstubAllGlobals(); });
+    const chatStore = useChatStore();
+    await chatStore.selectSession("s1");
+    let resolveView: ((value: unknown) => void) | undefined;
+    sessionServiceMocks.loadSessionView.mockImplementationOnce(() => new Promise((resolve) => { resolveView = resolve; }));
+    const switching = chatStore.selectSession("s2");
+    await vi.waitFor(() => expect(resolveView).toBeTypeOf("function"));
+    const delta = (text: string, streamRevision: number) => chatStore.handleStreamEvent(
+      { type: "textDelta", sessionId: "s2", runId: "run-s2", text },
+      streamRevision,
+    );
+    // Published while the view loads; the snapshot is cut at revision 12, so
+    // C and D are already in it and E and F are not.
+    delta("C", 11); delta("D", 12); delta("E", 13); delta("F", 14);
+    resolveView!({
+      session: {
+        id: "s2", title: "Session s2", messages: [], agentId: null, sessionType: "chat",
+        parentSessionId: null, latestCompletedRunId: null, createdAt: 0, updatedAt: 0,
+        runtime: {
+          activeRun: { runId: "run-s2", sessionId: "s2", status: "running", startedAt: 1, updatedAt: 1 },
+          streamingText: "ABCD", activeToolCalls: [], pendingToolConfirms: [], isCompacting: false,
+        },
+      },
+      streamRevision: 12,
+      oldestMessageRowId: 1,
+      hasMoreHistory: false,
+    });
+    await switching;
+    expect(chatStore.activeSessionId).toBe("s2");
+    expect(chatStore.rawStreamText).toBe("ABCDEF");
+    delta("G", 15);
+    expect(chatStore.rawStreamText).toBe("ABCDEFG");
+  });
+
   it("cancels a pending switch when the user reselects the visible session", async () => {
     const chatStore = useChatStore();
     await chatStore.selectSession("s1");

@@ -1,6 +1,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
+import { flushWindowEventInterests, watchWindowEventInterests } from "../services/windowEventInterests";
 import { answerQuestion as answerSessionQuestion, submitQuestionForm, cancelChat, chat } from "../services/session";
 import { gitExecute } from "../services/git";
 import type { StreamEvent, ModelOption, PendingQuestion, PendingToolConfirm, QuestionAnswerPayload } from "../types";
@@ -380,6 +381,7 @@ async function submit() {
   const workingDir = props.workingDir;
 
   try {
+    await flushWindowEventInterests();
     const { sessionId: sid, runId } = await chat({
       workspaceRef,
       sessionId: sessionId.value,
@@ -784,6 +786,10 @@ function handleKeydownWrapped(e: KeyboardEvent) {
 }
 
 let unlisten: RuntimeUnsubscribe | null = null;
+const releaseEventInterests = watchWindowEventInterests(() => sessionId.value
+  ? [{ sessionId: sessionId.value }]
+  : streaming.value && !nativeRunning.value && props.workspaceRef
+    ? [{ streamWorkspaceRef: props.workspaceRef }] : []);
 let destroyed = false;
 
 onMounted(async () => {
@@ -812,6 +818,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   destroyed = true;
+  releaseEventInterests();
   unlisten?.();
   document.removeEventListener("click", onModelClickOutside);
 });

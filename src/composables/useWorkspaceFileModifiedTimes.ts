@@ -1,5 +1,10 @@
 import { onScopeDispose, reactive, watch } from "vue";
-import { projectExplorerFileRevision, subscribeWorkspaceFileChanges } from "../services/workspaceExplorer";
+import type { WorkspaceRef } from "../services/project";
+import {
+  projectExplorerFileRevision,
+  subscribeWorkspaceFileChanges,
+  workspaceChangeAffectsPath,
+} from "../services/workspaceExplorer";
 
 export interface WorkspaceFileTimeTarget {
   projectId: string;
@@ -9,11 +14,14 @@ export interface WorkspaceFileTimeTarget {
 const normalizePath = (path: string) => path.replace(/\\/g, "/");
 const targetKey = (target: WorkspaceFileTimeTarget) => JSON.stringify([target.projectId, normalizePath(target.path)]);
 
-/** Load metadata only for the rendered file rows; reuse results across scrolling. */
+/** Load metadata only for the rendered file rows; reuse results across scrolling.
+ * `workspaceRefs` names the checkouts whose file changes should refresh rows;
+ * file changes are only delivered for checkouts this window registered. */
 export function useWorkspaceFileModifiedTimes(
   files: () => WorkspaceFileTimeTarget[],
   refreshToken: () => unknown,
   ownerWindow: Window | undefined = typeof window === "undefined" ? undefined : window,
+  workspaceRefs: () => readonly WorkspaceRef[] = () => [],
 ) {
   const cache = reactive<Record<string, { modifiedAt?: number; checkedAt: number }>>({});
   const queued = new Map<string, WorkspaceFileTimeTarget>();
@@ -61,11 +69,11 @@ export function useWorkspaceFileModifiedTimes(
 
   let release: (() => void) | undefined;
   void subscribeWorkspaceFileChanges((event) => {
-    const changedPath = normalizePath(event.payload.path);
-    enqueue(files().filter((file) => file.projectId === event.projectId && (
-      normalizePath(file.path) === changedPath || normalizePath(file.path).endsWith(`/${changedPath}`)
-    )), true);
-  }).then((unsubscribe) => {
+    // Row paths are absolute; a changed directory (rescan, delete, rename)
+    // covers every row below it.
+    enqueue(files().filter((file) => file.projectId === event.projectId
+      && workspaceChangeAffectsPath(event.payload.path, file.path, { anchored: false })), true);
+  }, workspaceRefs).then((unsubscribe) => {
     if (disposed) unsubscribe();
     else release = unsubscribe;
   }).catch(() => { /* The periodic metadata refresh remains available. */ });
