@@ -6,8 +6,15 @@ fn move_error(message: impl ToString) -> AppError {
     AppError::new("workspace.file_move_failed", message.to_string())
 }
 
+fn configuration_path(relative: &str) -> bool {
+    let path = relative.to_ascii_lowercase();
+    path == ".git" || path.starts_with(".git/") || path == ".locus" || path.starts_with(".locus/")
+        || path == "locus" || path == "locus/knowledge" || path == "locus/workspace-file-order.json" || path.starts_with("locus/workspace-trees")
+}
+
 /// Resolve both existing endpoints without following links outside this checkout.
-fn move_paths(root: &Path, source: &str, directory: &str) -> Result<(PathBuf, PathBuf), AppError> {
+/// `name` renames the entry inside `directory`; otherwise it keeps its name.
+fn move_paths(root: &Path, source: &str, directory: &str, name: Option<&str>) -> Result<(PathBuf, PathBuf), AppError> {
     let source_relative = super::super::workspace::normalize_workspace_sub_path(source)?;
     let directory_relative = super::super::workspace::normalize_workspace_sub_path(directory)?;
     if source_relative.is_empty() { return Err(move_error("Cannot move the workspace root")); }
@@ -25,9 +32,7 @@ fn move_paths(root: &Path, source: &str, directory: &str) -> Result<(PathBuf, Pa
     let source = dunce::canonicalize(source).map_err(move_error)?;
     let directory = dunce::canonicalize(directory).map_err(move_error)?;
     if directory.starts_with(&source) { return Err(move_error("Cannot move a folder into itself")); }
-    let protected = source_relative.to_ascii_lowercase();
-    if protected == ".git" || protected.starts_with(".git/") || protected == ".locus" || protected.starts_with(".locus/")
-        || protected == "locus" || protected == "locus/knowledge" || protected == "locus/workspace-file-order.json" || protected.starts_with("locus/workspace-trees") {
+    if configuration_path(&source_relative) {
         return Err(move_error("This workspace configuration path cannot be moved"));
     }
     let destination = directory_relative.to_ascii_lowercase();
@@ -35,7 +40,15 @@ fn move_paths(root: &Path, source: &str, directory: &str) -> Result<(PathBuf, Pa
         || destination.starts_with("locus/workspace-trees") {
         return Err(move_error("Files cannot be moved into workspace configuration folders"));
     }
-    let target = directory.join(source.file_name().ok_or_else(|| move_error("Invalid source name"))?);
+    let target = match name {
+        Some(name) => super::explorer_file_actions::sibling_file(&directory.join("entry"), name)?,
+        None => directory.join(source.file_name().ok_or_else(|| move_error("Invalid source name"))?),
+    };
+    let target_name = target.file_name().map(|name| name.to_string_lossy()).unwrap_or_default();
+    let target_relative = if directory_relative.is_empty() { target_name.into_owned() } else { format!("{directory_relative}/{target_name}") };
+    if configuration_path(&target_relative) {
+        return Err(move_error("This name is reserved for workspace configuration"));
+    }
     Ok((source, target))
 }
 
@@ -90,6 +103,19 @@ pub(super) fn rollback_moves(moves: &[(PathBuf, PathBuf)]) -> Result<(), AppErro
     Ok(())
 }
 
+/// A case-only rename on a case-insensitive file system sees its own source as
+/// an existing target, so it steps through a staging name.
+fn relocate_entry_renaming_case(source: &Path, target: &Path) -> Result<Vec<(PathBuf, PathBuf)>, AppError> {
+    if source == target || path_key(source) != path_key(target) { return relocate_entry(source, target); }
+    let staging = source.with_file_name(format!(".locus-rename-{}", uuid::Uuid::new_v4()));
+    let staged = relocate_entry(source, &staging)?;
+    match relocate_entry(&staging, target) {
+        // Both steps list the entry first and then its sidecars in the same order.
+        Ok(moved) => Ok(staged.into_iter().zip(moved).map(|((from, _), (_, to))| (from, to)).collect()),
+        Err(error) => { rollback_moves(&staged)?; Err(error) }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceFileMoveResult {
@@ -109,20 +135,54 @@ pub async fn workspace_move_entry(
     registry: State<'_, Arc<ProjectRegistry>>,
     app_handle: AppHandle,
 ) -> Result<WorkspaceFileMoveResult, AppError> {
+    relocate_workspace_entry(workspace_ref, &source_path, &target_directory, None, registry, app_handle).await
+}
+
+/// Renames a checkout file or folder in place through the move flow, so folders
+/// keep their Unity `.meta`, knowledge identity, layout references and order.
+/// Returns the new absolute path.
+pub(super) async fn rename_workspace_entry(
+    workspace_ref: WorkspaceRef,
+    source_path: &str,
+    name: &str,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_handle: AppHandle,
+) -> Result<String, AppError> {
+    let source = super::super::workspace::normalize_workspace_sub_path(source_path)?;
+    let parent = source.rsplit_once('/').map_or(".", |(parent, _)| parent).to_string();
+    let result = relocate_workspace_entry(workspace_ref, &source, &parent, Some(name), registry, app_handle).await?;
+    Ok(result.new_path)
+}
+
+async fn relocate_workspace_entry(
+    workspace_ref: WorkspaceRef,
+    source_path: &str,
+    target_directory: &str,
+    name: Option<&str>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_handle: AppHandle,
+) -> Result<WorkspaceFileMoveResult, AppError> {
     let registry_handle = Arc::clone(registry.inner());
     let scope = registry.resolve_workspace_ref(&workspace_ref).map_err(move_error)?;
     let runtime = scope.runtime();
     let root = runtime.root();
     let project_id = runtime.project_id().clone();
-    let (source, target) = move_paths(root, &source_path, &target_directory)?;
+    let (source, target) = move_paths(root, source_path, target_directory, name)?;
     let result = WorkspaceFileMoveResult {
         project_id: project_id.to_string(), root: root.to_string_lossy().into_owned(),
         path: source.to_string_lossy().into_owned(), new_path: target.to_string_lossy().into_owned(),
         is_directory: source.is_dir(), workspace_ref: workspace_ref.clone(),
     };
-    if path_key(&source) == path_key(&target) { return Ok(result); }
+    if source == target { return Ok(result); }
     let app_knowledge: State<'_, crate::commands::knowledge::AppKnowledgeDir> = app_handle.state();
     let sources = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(&root.to_string_lossy(), app_knowledge.0.as_ref().as_ref());
+    // Source roots (knowledge types, skill packages, mounts) move only through
+    // their own management flows, never as part of a parent folder.
+    if result.is_directory && sources.sources().iter().any(|knowledge| {
+        crate::knowledge_source_registry::path_is_within(&knowledge.physical_root, &source)
+    }) {
+        return Err(move_error("This folder contains a knowledge source and cannot be moved or renamed"));
+    }
     let from_knowledge = sources.classify_path(&source);
     let to_knowledge = sources.classify_path(&target);
     if from_knowledge.is_some() || to_knowledge.is_some() {
@@ -145,8 +205,10 @@ pub async fn workspace_move_entry(
         }
     } else {
         let (_, layout_root) = resolve_project(registry.inner().as_ref(), project_id.to_string(), "workspaceMoveEntry")?;
+        // Keep Markdown and CSV saves out of the move/reference-update transaction.
+        let _document_guard = super::super::view_documents::DOCUMENT_WRITE_LOCK.lock().map_err(move_error)?;
         let _guard = CSV_FILE_WRITE_LOCK.lock().map_err(move_error)?;
-        let moved = relocate_entry(&source, &target)?;
+        let moved = relocate_entry_renaming_case(&source, &target)?;
         let updated = match crate::workspace_tree::relocate_file_references(&layout_root, project_id.as_str(), &source, Some(&target)) {
             Ok(snapshot) => snapshot,
             Err(error) => { rollback_moves(&moved)?; return Err(move_error(error)); }
@@ -174,7 +236,7 @@ mod tests {
         for suffix in ["", ".meta", ".view", ".view.meta"] {
             std::fs::write(root.path().join(format!("a.csv{suffix}")), suffix).unwrap();
         }
-        let (source, target) = move_paths(root.path(), "a.csv", "target").unwrap();
+        let (source, target) = move_paths(root.path(), "a.csv", "target", None).unwrap();
         for suffix in [".meta", ".view", ".view.meta"] {
             let occupied = target.with_file_name(format!("a.csv{suffix}"));
             std::fs::write(&occupied, "occupied").unwrap();
@@ -207,7 +269,7 @@ mod tests {
         std::fs::create_dir(root.path().join("target")).unwrap();
         std::fs::write(root.path().join("source/nested/a.txt"), "content").unwrap();
         std::fs::write(root.path().join("source.meta"), "guid: abc").unwrap();
-        let (source, target) = move_paths(root.path(), "source", "target").unwrap();
+        let (source, target) = move_paths(root.path(), "source", "target", None).unwrap();
         let moves = relocate_entry(&source, &target).unwrap();
         assert_eq!(std::fs::read_to_string(target.join("nested/a.txt")).unwrap(), "content");
         assert_eq!(std::fs::read_to_string(target.with_file_name("source.meta")).unwrap(), "guid: abc");
@@ -220,11 +282,49 @@ mod tests {
         std::fs::create_dir_all(root.path().join("a/b")).unwrap();
         std::fs::create_dir_all(root.path().join("target/a")).unwrap();
         for (source, target) in [(".", "a"), ("../a", "."), ("a", "../"), ("a", "a/b"), ("a", "a")] {
-            assert!(move_paths(root.path(), source, target).is_err());
+            assert!(move_paths(root.path(), source, target, None).is_err());
         }
-        let (source, target) = move_paths(root.path(), "a", "target").unwrap();
+        let (source, target) = move_paths(root.path(), "a", "target", None).unwrap();
         assert!(relocate_entry(&source, &target).is_err());
         assert!(source.join("b").exists());
         assert!(target.is_dir());
+    }
+    #[test]
+    fn folder_rename_stays_in_parent_and_rejects_invalid_or_reserved_names() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs/old/nested")).unwrap();
+        std::fs::create_dir(root.path().join("top")).unwrap();
+        std::fs::write(root.path().join("docs/old/nested/a.md"), "content").unwrap();
+        std::fs::write(root.path().join("docs/old.meta"), "guid: abc").unwrap();
+        let (source, target) = move_paths(root.path(), "docs/old", "docs", Some(" new ")).unwrap();
+        assert_eq!(target, source.with_file_name("new"));
+        for name in ["", "..", "../escape", "a/b", "a\\b", "bad?", "trailing."] {
+            assert!(move_paths(root.path(), "docs/old", "docs", Some(name)).is_err(), "{name}");
+        }
+        for name in [".git", ".locus", "Locus"] {
+            assert!(move_paths(root.path(), "top", ".", Some(name)).is_err(), "{name}");
+        }
+        let moves = relocate_entry_renaming_case(&source, &target).unwrap();
+        assert_eq!(std::fs::read_to_string(target.join("nested/a.md")).unwrap(), "content");
+        assert_eq!(std::fs::read_to_string(target.with_file_name("new.meta")).unwrap(), "guid: abc");
+        assert!(!source.exists());
+        rollback_moves(&moves).unwrap();
+        assert!(source.join("nested/a.md").exists());
+        assert!(source.with_file_name("old.meta").exists());
+    }
+    #[test]
+    fn folder_rename_changes_only_letter_case() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("Docs/nested")).unwrap();
+        std::fs::write(root.path().join("Docs/nested/a.md"), "content").unwrap();
+        std::fs::write(root.path().join("Docs.meta"), "guid: abc").unwrap();
+        let (source, target) = move_paths(root.path(), "Docs", ".", Some("docs")).unwrap();
+        let moves = relocate_entry_renaming_case(&source, &target).unwrap();
+        assert_eq!(moves.iter().map(|(from, _)| from.clone()).collect::<Vec<_>>(), vec![source.clone(), source.with_file_name("Docs.meta")]);
+        let mut names: Vec<_> = std::fs::read_dir(root.path()).unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["docs", "docs.meta"]);
+        assert_eq!(std::fs::read_to_string(target.join("nested/a.md")).unwrap(), "content");
     }
 }

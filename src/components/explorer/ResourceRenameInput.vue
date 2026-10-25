@@ -10,7 +10,8 @@ const composing = ref(false);
 
 onMounted(() => {
   input.value?.focus();
-  const dot = props.rename.name.lastIndexOf(".");
+  // Folder names have no extension to keep, e.g. "v1.2".
+  const dot = props.rename.target.isDirectory ? -1 : props.rename.name.lastIndexOf(".");
   input.value?.setSelectionRange(0, dot > 0 ? dot : props.rename.name.length);
 });
 // A virtualized row or its checkout can disappear while being edited.

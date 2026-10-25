@@ -130,6 +130,22 @@ pub async fn explorer_file_action(
 ) -> Result<Option<String>, AppError> {
     let (project_id, root) =
         resolve_project(registry.inner().as_ref(), project_id, "explorerFileAction")?;
+    if let (Some(name), Some(reference)) = (new_name.as_deref(), workspace_ref.as_ref()) {
+        let directory = {
+            let scope = workspace_file_scope(reference, registry.inner().as_ref())?;
+            let directory = super::super::workspace::normalize_workspace_sub_path(&path).ok()
+                .filter(|relative| scope.runtime().root().join(relative).is_dir());
+            if directory.is_some() && scope.runtime().project_id() != &project_id {
+                return Err(action_error("Workspace does not belong to the project"));
+            }
+            directory
+        };
+        // Folder renames share the move flow: sidecars, knowledge folders and layout references.
+        if let Some(relative) = directory {
+            let next = super::workspace_file_move::rename_workspace_entry(reference.clone(), &relative, name, registry, app_handle).await?;
+            return Ok(Some(next));
+        }
+    }
     if let (None, Some(reference)) = (new_name.as_deref(), workspace_ref.as_ref()) {
         let scope = workspace_file_scope(reference, registry.inner().as_ref())?;
         if let Some(directory) = workspace_directory(scope.runtime().root(), &path)? {

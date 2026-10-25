@@ -118,18 +118,41 @@ describe("explorer resource menus", () => {
     expect(dragged).not.toHaveBeenCalled();
   });
 
-  it("offers directory path and delete actions without directory rename", () => {
+  it("offers rename, path and delete actions for workspace folders but not mounted folders", () => {
     const action = vi.fn();
     const menu = mount(ResourceFileMenuItems, { target: { ...file, path: "F:/Project/docs", isDirectory: true }, onAction: action });
+    button(menu.host, t("knowledge.explorer.rename")).click();
+    expect(action).toHaveBeenLastCalledWith("rename");
     button(menu.host, t("knowledge.explorer.openInFileSystem")).click();
     expect(action).toHaveBeenLastCalledWith("reveal");
     button(menu.host, t("knowledge.explorer.copyRelativePath")).click();
     expect(action).toHaveBeenLastCalledWith("copy");
-    expect([...menu.host.querySelectorAll("button")].some(item => item.textContent?.trim() === t("knowledge.explorer.rename"))).toBe(false);
     button(menu.host, t("knowledge.explorer.delete")).click();
     expect(action).toHaveBeenLastCalledWith("delete");
     const mounted = mount(ResourceFileMenuItems, { target: { ...file, path: "G:/shared/docs", isDirectory: true, mounted: true }, onAction: action });
     expect(mounted.host.querySelector("button.danger")).toBeNull();
+    expect([...mounted.host.querySelectorAll("button")].some(item => item.textContent?.trim() === t("knowledge.explorer.rename"))).toBe(false);
+    expect(mounted.host.firstElementChild?.classList.contains("base-context-menu-separator")).toBe(false);
+  });
+
+  it("renames workspace folders in place, selecting the whole folder name", async () => {
+    const folder = { ...file, path: "F:/Project/docs/v1.2", isDirectory: true };
+    mocks.fileAction.mockResolvedValueOnce("F:\\Project\\docs\\v2");
+    const changed = vi.fn();
+    const actions = mount(ExplorerResourceActions, { onChanged: changed });
+    await actions.instance.run("rename", folder);
+    const input = actions.host.querySelector<HTMLInputElement>(".resource-rename-input")!;
+    expect(input.value).toBe("v1.2");
+    expect(input.selectionEnd).toBe("v1.2".length);
+    submit("v2");
+    await flush();
+    expect(mocks.fileAction).toHaveBeenCalledExactlyOnceWith("project-a", "docs/v1.2", "v2", workspaceRef);
+    expect(changed).toHaveBeenCalledWith(folder, "F:\\Project\\docs\\v2");
+    expect(actions.host.querySelector(".resource-rename-input")).toBeNull();
+    mocks.fileAction.mockClear();
+    await actions.instance.run("rename", { ...folder, path: "G:/shared/docs", mounted: true });
+    expect(actions.host.querySelector(".resource-rename-input")).toBeNull();
+    expect(mocks.fileAction).not.toHaveBeenCalled();
   });
   it("changes only the rendered file label, preserving the file used by list actions", async () => {
     const selected = vi.fn();

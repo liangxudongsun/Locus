@@ -130,7 +130,8 @@ async function run(action: ExplorerResourceAction, target: ExplorerResourceTarge
         workspaceRef: workspaceRef ? { ...workspaceRef } : null,
       });
     } else if (action === "rename") {
-      if (draft.value?.busy || target.isDirectory || (target.document && isSkillPackageRootDocument(target.document))) return;
+      // Mounted folders are outside the checkout and have no rename flow.
+      if (draft.value?.busy || (target.isDirectory && target.mounted) || (target.document && isSkillPackageRootDocument(target.document))) return;
       const current: ExplorerResourceRename = reactive({
         key: rowKey, target, name: resourceName(target), busy: false, error: "",
         submit: () => commit(current), cancel: () => cancel(current),
