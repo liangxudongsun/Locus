@@ -36,7 +36,9 @@ const buildModes = new Map([
       cargoEnv: {
         CARGO_PROFILE_RELEASE_INCREMENTAL: "false",
         CARGO_PROFILE_RELEASE_LTO: "thin",
-        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1",
+        // One unit ran the ~450k-line locus crate through LLVM on a single
+        // thread (~26 min per flavor); 16 units parallelize it under ThinLTO.
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16",
       },
     },
   ],
