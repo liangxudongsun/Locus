@@ -82,9 +82,11 @@ function escapeHtml(source: string): string {
         :data-line-number="sourceLine(i)"
       ><span class="atv-ln">{{ sourceLine(i) }}</span><span class="atv-text" v-html="line || ' '"></span>
 </span></code></pre>
-    </div>
-    <div v-if="truncated" class="atv-footer">
-      {{ t("asset.preview.truncated", shownLines) }}
+      <!-- In the scroll flow, not a fixed footer: only files over the preview
+           budget reach it, and it must not take height from the code. -->
+      <div v-if="truncated" class="atv-truncated">
+        {{ t("asset.preview.truncated", shownLines) }}
+      </div>
     </div>
   </SearchableContent>
 </template>
@@ -144,12 +146,10 @@ function escapeHtml(source: string): string {
   flex: 1;
   white-space: pre;
 }
-.atv-footer {
-  padding: 6px 12px;
+.atv-truncated {
+  padding: 0 12px 8px 60px;
   font-size: 11px;
   color: var(--text-secondary);
-  border-top: 1px solid var(--border-color);
-  background: color-mix(in srgb, var(--panel-bg) 78%, var(--hover-bg) 22%);
-  flex-shrink: 0;
+  user-select: none;
 }
 </style>

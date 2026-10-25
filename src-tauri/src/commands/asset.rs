@@ -1373,12 +1373,25 @@ pub async fn search_workspace_assets(
 
 // ── preview_workspace_asset (Slice 3a: text dispatch only, others stubbed) ──
 
-/// Maximum lines a text snippet may contain. Matches the existing
-/// `preview_workspace_file` budget so the asset page and chat hover popover
-/// behave the same way for the same file.
-const TEXT_SNIPPET_MAX_LINES: usize = 200;
-/// Hard byte cap for the snippet to defend against very long lines.
-const TEXT_SNIPPET_MAX_BYTES: usize = 32 * 1024;
+/// Maximum lines a text snippet may contain. The asset tab is a code reader,
+/// so this matches the full-file budget of `preview_workspace_file`: ordinary
+/// source files are shown whole and only pathological files are cut.
+const TEXT_SNIPPET_MAX_LINES: usize = 20_000;
+/// Hard byte cap for the snippet to defend against huge or very long-line files.
+const TEXT_SNIPPET_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// First line of the snippet window. Files are read from the top unless the
+/// focus line lies past the middle of the line budget; then the window is
+/// centered on it so the focused line is still in the snippet.
+fn text_snippet_start_line(focus_line: Option<u32>) -> u32 {
+    let requested_line = focus_line.unwrap_or(1).max(1);
+    let half = (TEXT_SNIPPET_MAX_LINES / 2) as u32;
+    if requested_line > half {
+        requested_line - half
+    } else {
+        1
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2093,12 +2106,7 @@ fn read_text_snippet(path: &Path, focus_line: Option<u32>) -> Result<AssetTextPr
     })?;
     let mut reader = BufReader::new(file);
 
-    let requested_line = focus_line.unwrap_or(1).max(1);
-    let start_line = if requested_line > TEXT_SNIPPET_MAX_LINES as u32 / 2 {
-        requested_line.saturating_sub(50).max(1)
-    } else {
-        1
-    };
+    let start_line = text_snippet_start_line(focus_line);
     let mut skipped_lines: u32 = 0;
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     while skipped_lines < start_line.saturating_sub(1) {
@@ -2204,13 +2212,7 @@ fn try_read_detected_text_snippet(path: &Path, focus_line: Option<u32>) -> Optio
     bytes.truncate(TEXT_SNIPPET_MAX_BYTES);
     let decoded = super::text_preview::decode_text_preview(&bytes, truncated)?;
     let lines: Vec<_> = decoded.text.lines().collect();
-    let requested_line = focus_line.unwrap_or(1).max(1);
-    let start_line = if requested_line > TEXT_SNIPPET_MAX_LINES as u32 / 2 {
-        requested_line.saturating_sub(50).max(1)
-    } else {
-        1
-    }
-    .min(lines.len().max(1) as u32);
+    let start_line = text_snippet_start_line(focus_line).min(lines.len().max(1) as u32);
     let skipped = (start_line - 1) as usize;
     truncated |= skipped > 0;
     let mut snippet = String::new();
@@ -3496,19 +3498,35 @@ mod tests {
     }
 
     #[test]
-    fn text_preview_centers_the_requested_source_line() {
+    fn text_preview_reads_ordinary_source_files_whole() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let path = temp.path().join("LongScript.cs");
-        let source = (1..=300)
+        let source = (1..=3000)
             .map(|line| format!("// line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&path, source).expect("write script");
 
-        let preview = read_text_snippet(&path, Some(250)).expect("preview script");
-        assert_eq!(preview.start_line, 200);
-        assert!(preview.snippet.contains("// line 250"));
-        assert!(!preview.snippet.contains("// line 1\n"));
+        let preview = read_text_snippet(&path, Some(2500)).expect("preview script");
+        assert_eq!(preview.start_line, 1);
+        assert_eq!(preview.total_lines, 3000);
+        assert!(preview.snippet.starts_with("// line 1\n"));
+        assert!(preview.snippet.ends_with("// line 3000\n"));
+        assert!(!preview.truncated);
+    }
+
+    #[test]
+    fn text_preview_centers_a_focus_line_beyond_the_line_budget() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let path = temp.path().join("Huge.cs");
+        let total = TEXT_SNIPPET_MAX_LINES + 5000;
+        let source = (1..=total).map(|line| format!("{line}\n")).collect::<String>();
+        std::fs::write(&path, source).expect("write script");
+
+        let focus = (TEXT_SNIPPET_MAX_LINES + 2000) as u32;
+        let preview = read_text_snippet(&path, Some(focus)).expect("preview script");
+        assert_eq!(preview.start_line, focus - (TEXT_SNIPPET_MAX_LINES / 2) as u32);
+        assert!(preview.snippet.contains(&format!("\n{focus}\n")));
         assert!(preview.truncated);
     }
 

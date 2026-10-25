@@ -1803,6 +1803,7 @@ onBeforeUnmount(() => {
         :snippet="textPayload.snippet"
         :truncated="textPayload.truncated"
         :total-lines="textPayload.totalLines"
+        :start-line="textPayload.startLine ?? 1"
         :language="textPayload.language"
         :focus-line="focusLine"
       />

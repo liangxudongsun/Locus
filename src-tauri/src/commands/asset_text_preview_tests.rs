@@ -92,13 +92,20 @@ fn text_preview_fallback_caps_reads_and_does_not_split_unicode_characters() {
 fn text_preview_fallback_honors_line_budget_and_focus_within_the_read_prefix() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("lines.custom");
-    let text = (1..=500)
-        .map(|line| format!("line {line}\n"))
-        .collect::<String>();
+    let total = TEXT_SNIPPET_MAX_LINES + 5000;
+    let text = (1..=total).map(|line| format!("{line}\n")).collect::<String>();
     std::fs::write(&path, text).unwrap();
-    let preview = try_read_detected_text_snippet(&path, Some(250)).unwrap();
-    assert_eq!(preview.start_line, 200);
-    assert_eq!(preview.snippet.lines().count(), TEXT_SNIPPET_MAX_LINES);
-    assert!(preview.snippet.contains("line 250\n"));
+
+    let whole = try_read_detected_text_snippet(&path, Some(250)).unwrap();
+    assert_eq!(whole.start_line, 1);
+    assert_eq!(whole.snippet.lines().count(), TEXT_SNIPPET_MAX_LINES);
+    assert!(whole.truncated);
+
+    let focus = (TEXT_SNIPPET_MAX_LINES + 2000) as u32;
+    let preview = try_read_detected_text_snippet(&path, Some(focus)).unwrap();
+    assert_eq!(preview.start_line, focus - (TEXT_SNIPPET_MAX_LINES / 2) as u32);
+    assert_eq!(preview.snippet.lines().count(), total - preview.start_line as usize + 1);
+    assert!(preview.snippet.contains(&format!("\n{focus}\n")));
+    assert!(preview.snippet.ends_with(&format!("\n{total}\n")));
     assert!(preview.truncated);
 }
